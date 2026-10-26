@@ -31,10 +31,16 @@ def test_test_connection(ctx):
     assert info["transactions_supported"] is False and info["default_database"] == TEST_DB
 
 
+def test_poll_monitoring_is_used(ctx):
+    cli = ctx["mgr"].client("main")
+    assert cli.options.server_monitoring_mode == "poll"
+    assert ok(call(T.count_documents, collection="x"))["count"] == 0
+
+
 def test_list_connections_hides_secrets(ctx):
     res = ok(call(T.list_connections))
     text = json.dumps(res)
-    assert "Str0ng" not in text and "***" in text and res["connections"][0]["connected"] is True
+    assert "Str0ng" not in text and "***" in text and res["connections"][0]["client_open"] is True
 
 
 def test_wrong_password_and_unreachable_server(ctx):
@@ -47,6 +53,8 @@ def test_wrong_password_and_unreachable_server(ctx):
     started = time.monotonic()
     e = err(call(T.test_connection, connection="dead"))
     assert "Could not reach" in e["message"] and time.monotonic() - started < 15
+    assert e["servers"][0]["address"] == "127.0.0.1:1" and e["servers"][0]["type"] == "Unknown"
+    assert "refused" in e["servers"][0]["error"].lower() or e["servers"][0]["error"]
     mgr.remove("bad")
     mgr.remove("dead")
     assert "Unknown connection" in err(call(T.find, collection="x", connection="dead"))["message"]

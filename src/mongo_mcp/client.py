@@ -30,6 +30,9 @@ def client_kwargs(profile: MongoProfile, env: Mapping[str, str] | None = None) -
         "connectTimeoutMS": min(profile.server_selection_timeout_ms, 20000),
         "tz_aware": True,
         "uuidRepresentation": "standard",
+        # "poll" uses short request/response heartbeats instead of long-lived streaming ones that
+        # firewalls/VPNs tend to cut (which makes the driver reset pools and cancel running operations).
+        "serverMonitoringMode": profile.server_monitoring_mode,
     }
     if profile.uri:
         host: str | list[str] = profile.uri
@@ -142,6 +145,14 @@ class ClientManager:
                 self._clients[key] = cli
             return cli
 
+    def existing_client(self, name: str | None) -> Any:
+        """The already-open client for a profile, or None (never opens a new one)."""
+        try:
+            key = self._resolve(name)
+        except ConfigError:
+            return None
+        return self._clients.get(key)
+
     def database_name(self, name: str | None, database: str | None) -> str:
         db = database or self.profile(name).database
         if not db:
@@ -173,7 +184,7 @@ class ClientManager:
         for name, prof in self._profiles.items():
             info = prof.public_dict()
             info["is_default"] = name == self._default
-            info["connected"] = name in self._clients
+            info["client_open"] = name in self._clients  # opened on first use; not a health check
             out.append(info)
         for name, err in self._broken.items():
             out.append({"name": name, "broken": True, "error": err})

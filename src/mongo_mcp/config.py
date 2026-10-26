@@ -83,6 +83,7 @@ class MongoProfile:
     max_docs: int = 100
     max_time_ms: int = 60000
     server_selection_timeout_ms: int = 10000
+    server_monitoring_mode: str = "poll"   # poll | stream | auto
     app_name: str = "mongo-mcp"
 
     def __post_init__(self) -> None:
@@ -127,6 +128,10 @@ class MongoProfile:
             if match is None:
                 raise ConfigError(f"[{self.name}] 'read_preference' must be one of {', '.join(READ_PREFERENCES)}")
             self.read_preference = match
+        mode = str(self.server_monitoring_mode or "poll").strip().lower()
+        if mode not in ("poll", "stream", "auto"):
+            raise ConfigError(f"[{self.name}] 'server_monitoring_mode' must be poll, stream or auto")
+        self.server_monitoring_mode = mode
         self.max_docs = _to_int(self.max_docs, "max_docs", 1)
         self.max_time_ms = _to_int(self.max_time_ms, "max_time_ms", 0)
         self.server_selection_timeout_ms = _to_int(self.server_selection_timeout_ms, "server_selection_timeout_ms", 1)
@@ -186,6 +191,7 @@ _ENV_MAP = {
     "TLS_CERTIFICATE_KEY_FILE": "tls_certificate_key_file", "READ_PREFERENCE": "read_preference",
     "READONLY": "readonly", "MAX_DOCS": "max_docs", "MAX_TIME_MS": "max_time_ms",
     "SERVER_SELECTION_TIMEOUT_MS": "server_selection_timeout_ms", "APP_NAME": "app_name",
+    "SERVER_MONITORING_MODE": "server_monitoring_mode",
 }
 
 

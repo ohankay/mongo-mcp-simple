@@ -13,7 +13,8 @@ from . import __version__
 def _check(connection: str | None) -> int:
     from .client import ClientManager
     from .config import load_profiles
-    from .server import _error, _server_info, set_manager
+    from .errors import is_network_error
+    from .server import _error, _server_info, _topology, set_manager
 
     try:
         import pymongo
@@ -38,6 +39,8 @@ def _check(connection: str | None) -> int:
             info = {"success": True, **_server_info(name)}
         except Exception as exc:  # noqa: BLE001
             info = _error(exc)
+            if is_network_error(exc):
+                info["error"]["servers"] = _topology(name)
         ok = ok and bool(info.get("success"))
         report["connections"][name] = info
     mgr.close_all()

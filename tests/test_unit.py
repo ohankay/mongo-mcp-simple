@@ -285,3 +285,37 @@ def test_install_cmd_uses_crlf_and_offline_install():
     raw = (ROOT / "bundle" / "install.cmd").read_bytes()
     assert raw.count(b"\r\n") == raw.count(b"\n")
     assert b"--no-index" in raw and b"wheelhouse" in raw and b"pip check" in raw
+
+
+# ---------------------------------------------------------------- network diagnostics (1.0.1)
+
+def test_server_monitoring_mode():
+    _, kw = client_kwargs(MongoProfile(name="a", host="h"))
+    assert kw["serverMonitoringMode"] == "poll"
+    _, kw = client_kwargs(MongoProfile(name="a", host="h", server_monitoring_mode="Stream"))
+    assert kw["serverMonitoringMode"] == "stream"
+    with pytest.raises(ConfigError, match="server_monitoring_mode"):
+        MongoProfile(name="a", host="h", server_monitoring_mode="push")
+    import pymongo
+    pymongo.MongoClient("h", connect=False, **client_kwargs(MongoProfile(name="a", host="h"))[1]).close()
+
+
+def test_operation_cancelled_is_explained():
+    from pymongo import errors as pe
+
+    from mongo_mcp.errors import describe_error, is_network_error
+    exc = pe._OperationCancelled("operation cancelled")
+    info = describe_error(exc)
+    assert info["type"] == "_OperationCancelled" and "connection to the server was reset" in info["message"]
+    assert is_network_error(exc) and is_network_error(pe.ServerSelectionTimeoutError("x"))
+    assert "Lost the connection" in describe_error(pe.AutoReconnect("connection closed"))["message"]
+    assert not is_network_error(ValueError("x"))
+
+
+def test_existing_client_never_opens():
+    opened = []
+    mgr = ClientManager({"a": MongoProfile(name="a", host="h")}, "a", opener=lambda p: opened.append(p) or object())
+    assert mgr.existing_client("a") is None and mgr.existing_client("missing") is None and not opened
+    cli = mgr.client("a")
+    assert mgr.existing_client(None) is cli and len(opened) == 1
+    assert mgr.describe()[0]["client_open"] is True

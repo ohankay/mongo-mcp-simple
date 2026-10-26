@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mongo-mcp-simple"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP server for MongoDB (4.4+) for VS Code agents - queries, aggregation, writes, transactions, indexes, admin commands. Password, LDAP, Kerberos (Windows logon), x509 or URI authentication."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ keywords = ["mcp", "mongodb", "vscode", "copilot", "agent"]
 dependencies = [
     "mcp>=1.10,<2",
     "anyio>=4",
-    "pymongo>=4.6",
+    "pymongo>=4.7",  # serverMonitoringMode
     # mcp needs pywin32 (pywintypes) on Windows; declared explicitly so every install path gets it.
     "pywin32>=306; sys_platform == 'win32'",
     # Kerberos (GSSAPI) with the logged-on Windows user: auth "windows".

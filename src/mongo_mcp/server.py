@@ -14,7 +14,7 @@ from .bsonutil import (MAX_RESPONSE_CHARS, ReadOnlyViolation, check_command_read
                        collect_documents, parse_ejson, to_jsonable)
 from .client import ClientManager
 from .config import ConfigError, load_profiles, profile_from_mapping
-from .errors import describe_error
+from .errors import describe_error, is_network_error
 
 log = logging.getLogger("mongo_mcp")
 
@@ -57,7 +57,26 @@ def _error(exc: BaseException) -> dict[str, Any]:
     return {"success": False, "error": describe_error(exc)}
 
 
-async def _call(fn: Callable[[], Any]) -> str:
+def _topology(connection: str | None) -> list[dict[str, Any]] | None:
+    """Per-server state as the driver sees it - the real reason behind network-type errors."""
+    try:
+        cli = manager().existing_client(connection)
+        if cli is None:
+            return None
+        servers = []
+        for sd in cli.topology_description.server_descriptions().values():
+            entry: dict[str, Any] = {"address": f"{sd.address[0]}:{sd.address[1]}", "type": sd.server_type_name}
+            if sd.round_trip_time is not None:
+                entry["round_trip_ms"] = round(sd.round_trip_time * 1000, 1)
+            if sd.error is not None:
+                entry["error"] = str(sd.error)[:500]
+            servers.append(entry)
+        return servers
+    except Exception:  # noqa: BLE001 - diagnostics are best effort
+        return None
+
+
+async def _call(fn: Callable[[], Any], connection: str | None = None) -> str:
     def guarded() -> Any:
         try:
             result = fn()
@@ -65,7 +84,12 @@ async def _call(fn: Callable[[], Any]) -> str:
                 result = {"success": True, **result}
             return result
         except Exception as exc:  # noqa: BLE001 - reported to the model as a structured error
-            return _error(exc)
+            out = _error(exc)
+            if is_network_error(exc):
+                topo = _topology(connection)
+                if topo:
+                    out["error"]["servers"] = topo
+            return out
 
     result = await anyio.to_thread.run_sync(guarded)
     return json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -184,7 +208,7 @@ def _server_info(connection: str | None) -> dict[str, Any]:
 async def test_connection(connection: str | None = None) -> str:
     """Connect and return server version, edition, topology (standalone / replica set / sharded), the authenticated
     user and whether transactions are supported."""
-    return await _call(lambda: _server_info(connection))
+    return await _call(lambda: _server_info(connection), connection)
 
 
 @tool(_WRITE)
@@ -210,7 +234,7 @@ async def add_connection(name: str, host: str | None = None, uri: str | None = N
         info = _server_info(name)
         info["added"] = name
         return info
-    return await _call(run)
+    return await _call(run, name)
 
 
 @tool(_WRITE)
@@ -233,7 +257,7 @@ async def list_databases(connection: str | None = None) -> str:
                for d in res.get("databases", [])]
         return {"databases": sorted(dbs, key=lambda d: d["name"]),
                 "total_size_mb": round(res.get("totalSize", 0) / 1048576, 2)}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -261,7 +285,7 @@ async def list_collections(connection: str | None = None, database: str | None =
                     pass
             items.append(entry)
         return {"database": db.name, "collections": sorted(items, key=lambda c: c["name"])}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -276,7 +300,7 @@ async def collection_stats(collection: str, connection: str | None = None, datab
                 "total_index_size_mb": mb(s.get("totalIndexSize")), "index_count": s.get("nindexes"),
                 "index_sizes_mb": {k: mb(v) for k, v in (s.get("indexSizes") or {}).items()},
                 "capped": s.get("capped", False)}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -285,7 +309,7 @@ async def list_indexes(collection: str, connection: str | None = None, database:
     def run():
         idx = [to_jsonable(i) for i in _coll(connection, database, collection).list_indexes()]
         return {"collection": collection, "indexes": idx}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 _TYPE_NAMES = {
@@ -327,7 +351,7 @@ async def infer_schema(collection: str, connection: str | None = None, database:
         fields = [{"path": p, "types": t, "present_pct": round(100 * sum(t.values()) / len(docs), 1) if docs else 0}
                   for p, t in sorted(stats.items())]
         return {"collection": collection, "sampled": len(docs), "fields": fields}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 # ====================================================================== reads
@@ -347,7 +371,7 @@ async def find(collection: str, filter: Any = None, projection: Any = None, sort
             sort=_sort_spec(sort), skip=max(0, int(skip)), limit=n + 1, max_time_ms=_max_time(connection, max_time_ms),
             collation=_collation(collation))
         return collect_documents(cursor, n)
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -369,7 +393,7 @@ async def aggregate(collection: str, pipeline: Any, connection: str | None = Non
         if mt:
             kwargs["maxTimeMS"] = mt
         return collect_documents(_coll(connection, database, collection).aggregate(stages, **kwargs), n)
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -386,7 +410,7 @@ async def count_documents(collection: str, filter: Any = None, estimated: bool =
         if col:
             kwargs["collation"] = col
         return {"count": coll.count_documents(parse_ejson(filter, "filter") or {}, **kwargs)}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -400,7 +424,7 @@ async def distinct(collection: str, field: str, filter: Any = None, connection: 
         if len(values) > 5000:
             out["truncated"] = True
         return out
-    return await _call(run)
+    return await _call(run, connection)
 
 
 # ====================================================================== writes
@@ -421,7 +445,7 @@ async def insert_documents(collection: str, documents: Any, connection: str | No
             raise ValueError("'documents' must be a non-empty array of objects")
         res = coll.insert_many(docs, ordered=ordered)
         return {"inserted_count": len(res.inserted_ids), "inserted_ids": to_jsonable(res.inserted_ids[:1000])}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_WRITE)
@@ -448,7 +472,7 @@ async def update_documents(collection: str, filter: Any, update: Any, many: bool
         if res.upserted_id is not None:
             out["upserted_id"] = to_jsonable(res.upserted_id)
         return out
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_WRITE)
@@ -466,7 +490,7 @@ async def replace_document(collection: str, filter: Any, replacement: Any, upser
         if res.upserted_id is not None:
             out["upserted_id"] = to_jsonable(res.upserted_id)
         return out
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_DESTRUCTIVE)
@@ -483,7 +507,7 @@ async def delete_documents(collection: str, filter: Any, many: bool = False, con
         coll = _coll(connection, database, collection)
         res = (coll.delete_many if many else coll.delete_one)(flt, collation=_collation(collation))
         return {"deleted_count": res.deleted_count}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 _TX_OPS = {"insert", "insert_many", "update", "update_many", "replace", "delete", "delete_many"}
@@ -553,7 +577,7 @@ async def run_transaction(operations: Any, connection: str | None = None, databa
             out["committed"] = False
             return out
         return {"committed": True, "results": results}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 # ====================================================================== indexes & collections
@@ -579,7 +603,7 @@ async def create_index(collection: str, keys: Any, name: str | None = None, uniq
             kwargs["partialFilterExpression"] = parse_ejson(partial_filter, "partial_filter")
         created = _coll(connection, database, collection).create_index(items, **kwargs)
         return {"index": created}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_DESTRUCTIVE)
@@ -591,7 +615,7 @@ async def drop_index(collection: str, name: str, connection: str | None = None, 
             raise ValueError("The _id index cannot be dropped")
         _coll(connection, database, collection).drop_index(name)
         return {"dropped": name}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_WRITE)
@@ -608,7 +632,7 @@ async def create_collection(name: str, options: Any = None, connection: str | No
         cmd.update(opts)
         db.command(cmd)
         return {"created": name, "database": db.name}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_DESTRUCTIVE)
@@ -624,7 +648,7 @@ async def drop_collection(collection: str, confirm_name: str, connection: str | 
             raise ValueError(f"Collection '{collection}' does not exist in database '{db.name}'")
         db.drop_collection(collection)
         return {"dropped": collection, "database": db.name}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_WRITE)
@@ -635,7 +659,7 @@ async def rename_collection(collection: str, new_name: str, drop_target: bool = 
         _writable(connection)
         _coll(connection, database, collection).rename(new_name, dropTarget=drop_target)
         return {"renamed": collection, "to": new_name}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_DESTRUCTIVE)
@@ -649,7 +673,7 @@ async def drop_database(database: str, confirm_name: str, connection: str | None
             raise ValueError(f"Refusing to drop system database '{database}'")
         manager().client(connection).drop_database(database)
         return {"dropped": database}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 # ====================================================================== commands & administration
@@ -672,7 +696,7 @@ async def run_command(command: Any, connection: str | None = None, database: str
         if len(text) > MAX_RESPONSE_CHARS:
             return {"truncated": True, "result_text": text[:MAX_RESPONSE_CHARS]}
         return {"result": json.loads(text)}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -685,7 +709,7 @@ async def server_status(connection: str | None = None) -> str:
                 "connections": to_jsonable(s.get("connections")), "opcounters": to_jsonable(s.get("opcounters")),
                 "memory_mb": to_jsonable(s.get("mem")), "replica_set": repl.get("setName"),
                 "is_primary": repl.get("isWritablePrimary", repl.get("ismaster"))}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_READ)
@@ -709,7 +733,7 @@ async def current_ops(connection: str | None = None, active_only: bool = True, m
                         "app_name": op.get("appName"), "command": command[:2000]})
         ops.sort(key=lambda o: -o["secs_running"])
         return {"count": len(ops), "operations": ops[:500]}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 @tool(_DESTRUCTIVE)
@@ -719,7 +743,7 @@ async def kill_op(opid: Any, connection: str | None = None) -> str:
         _writable(connection)
         manager().client(connection).admin.command("killOp", op=opid)
         return {"killed": opid}
-    return await _call(run)
+    return await _call(run, connection)
 
 
 def run_stdio() -> None:
