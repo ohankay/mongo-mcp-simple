@@ -7,13 +7,21 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # MongoDB 8.0.x refuses to start on Linux kernel 6.19+ (SERVER-121912), which GitHub runners use;
+    # 8.2 / 7.0 / 4.4 are not affected.
     services:
-      mongo8:
-        image: mongo:8.0
+      mongo82:
+        image: mongo:8.2
         env:
           MONGO_INITDB_ROOT_USERNAME: root
           MONGO_INITDB_ROOT_PASSWORD: "Str0ng!Pass"
-        ports: ["27018:27017"]
+        ports: ["27082:27017"]
+      mongo70:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: "Str0ng!Pass"
+        ports: ["27070:27017"]
       mongo44:
         image: mongo:4.4
         env:
@@ -27,7 +35,7 @@ jobs:
           python-version: "3.12"
       - name: Start a single-node replica set (transactions)
         run: |
-          docker run -d --name mongo-rs -p 27019:27019 mongo:8.0 mongod --replSet rs0 --port 27019 --bind_ip_all
+          docker run -d --name mongo-rs -p 27019:27019 mongo:8.2 mongod --replSet rs0 --port 27019 --bind_ip_all
           for i in $(seq 1 30); do
             docker exec mongo-rs mongosh --port 27019 --quiet --eval "db.adminCommand('ping')" && break
             if [ "$(docker inspect -f '{{.State.Running}}' mongo-rs)" != "true" ]; then
@@ -41,7 +49,8 @@ jobs:
         run: |
           python - <<'PY'
           import time, pymongo
-          for uri in ("mongodb://root:Str0ng%21Pass@localhost:27018/", "mongodb://root:Str0ng%21Pass@localhost:27044/",
+          for uri in ("mongodb://root:Str0ng%21Pass@localhost:27082/", "mongodb://root:Str0ng%21Pass@localhost:27070/",
+                      "mongodb://root:Str0ng%21Pass@localhost:27044/",
                       "mongodb://localhost:27019/?replicaSet=rs0"):
               for _ in range(60):
                   try:
@@ -54,9 +63,9 @@ jobs:
               else:
                   raise SystemExit(f"{uri} not ready")
           PY
-      - name: Tests (MongoDB 8.0 + 4.4 + replica set)
+      - name: Tests (MongoDB 8.2 + 7.0 + 4.4 + replica set)
         env:
-          MONGO_MCP_TEST_TARGETS: "mongo8=mongodb://root:Str0ng%21Pass@localhost:27018/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
+          MONGO_MCP_TEST_TARGETS: "mongo82=mongodb://root:Str0ng%21Pass@localhost:27082/;mongo70=mongodb://root:Str0ng%21Pass@localhost:27070/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
           MONGO_MCP_TEST_RS: "mongodb://localhost:27019/?replicaSet=rs0"
         run: pytest -v
 

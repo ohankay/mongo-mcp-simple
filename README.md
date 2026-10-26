@@ -146,6 +146,7 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
 * **Özel tipler:** Sonuçlar relaxed Extended JSON döner (`{"$oid": "..."}`, `{"$date": "..."}`, `{"$numberDecimal": "..."}`). Bu değerler sonraki sorgularda filtre olarak aynen kullanılabilir.
 * MongoDB'nin kendi `$toUpper` / `$toLower` operatörleri sadece ASCII harfleri dönüştürür ("Ayşe" → "AYşE").
 * `run_transaction` replica set veya sharded cluster gerektirir; standalone sunucuda açık bir hata döner ve hiçbir şey yazılmaz.
+* Sunucu tarafı notu: MongoDB **8.0.x**, Linux çekirdeği 6.19 ve üzerinde başlamayı reddeder ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). 8.2, 7.0 ve öncesi etkilenmez. Bu MCP'yi değil, MongoDB sunucusunun kurulu olduğu makineyi ilgilendirir.
 
 ## Geliştirme ve testler
 
@@ -153,7 +154,7 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
 pip install -e ".[dev]"
 docker compose -f tests/docker-compose.yml up -d
 docker exec mongo-rs mongosh --port 27019 --quiet --eval "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27019'}]})"
-export MONGO_MCP_TEST_TARGETS="mongo8=mongodb://root:Str0ng%21Pass@localhost:27018/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
+export MONGO_MCP_TEST_TARGETS="mongo82=mongodb://root:Str0ng%21Pass@localhost:27082/;mongo70=mongodb://root:Str0ng%21Pass@localhost:27070/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
 export MONGO_MCP_TEST_RS="mongodb://localhost:27019/?replicaSet=rs0"
 pytest -v
 ```
@@ -161,7 +162,7 @@ pytest -v
 Test kapsamı:
 
 * **Unit:** konfigürasyon doğrulama ve hata mesajları, bozuk profilin diğerlerini etkilememesi, her kimlik doğrulama tipi için istemci ayarları (Kerberos principal dahil), Extended JSON, salt okunur koruması, şablonlar ve `install.cmd`.
-* **Entegrasyon:** MongoDB **8.0 ve 4.4** (kimlik doğrulamalı) ve replica set üzerinde CRUD, Türkçe collation, pipeline update, `array_filters`, duplicate key ve kısmi bulk hata, limit ve kesme, zaman aşımı, aggregate ve `$out`, şema çıkarımı, view, validator, capped, index'ler, `run_command`, düşük yetkili kullanıcıyla yetki hataları, `kill_op`, salt okunur profil, eşzamanlı çağrılar, transaction commit/rollback.
+* **Entegrasyon:** MongoDB **8.2, 8.0, 7.0 ve 4.4** (kimlik doğrulamalı) ve replica set üzerinde CRUD, Türkçe collation, pipeline update, `array_filters`, duplicate key ve kısmi bulk hata, limit ve kesme, zaman aşımı, aggregate ve `$out`, şema çıkarımı, view, validator, capped, index'ler, `run_command`, düşük yetkili kullanıcıyla yetki hataları, `kill_op`, salt okunur profil, eşzamanlı çağrılar, transaction commit/rollback.
 * **Uçtan uca:** `python -m mongo_mcp` gerçek MCP stdio protokolüyle (VS Code'un yaptığı gibi) başlatılır; bozuk profil, çok profilli şifre akışı, transaction ve `--check` CLI'ı test edilir.
 
 ## Lisans

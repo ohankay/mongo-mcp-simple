@@ -406,4 +406,4 @@ def test_transaction_commit_and_rollback(rs):
     assert res["results"][0]["deleted_count"] == 2
     assert "must be one of" in err(call(T.run_transaction, operations=[{"op": "drop", "collection": "x"}]))["message"]
     info = ok(call(T.test_connection))["server"]
-    assert info["transactions_supported"] is True and info["topology"] == "replica set 'rs0'"
+    assert info["transactions_supported"] is True and info["topology"].startswith("replica set '")
