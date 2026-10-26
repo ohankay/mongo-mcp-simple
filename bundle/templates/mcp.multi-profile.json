@@ -1,0 +1,17 @@
+{
+  "inputs": [
+    { "type": "promptString", "id": "mongo-pw-test", "description": "TEST MongoDB - app_user sifresi", "password": true },
+    { "type": "promptString", "id": "mongo-pw-prod", "description": "PROD MongoDB - report_user sifresi", "password": true }
+  ],
+  "servers": {
+    "mongo": {
+      "type": "stdio",
+      "command": "${userHome}\\.mongo-mcp\\Scripts\\mongo-mcp.exe",
+      "env": {
+        "MONGO_MCP_CONFIG": "${userHome}\\.mongo-mcp\\connections.json",
+        "MONGO_PW_TEST": "${input:mongo-pw-test}",
+        "MONGO_PW_PROD": "${input:mongo-pw-prod}"
+      }
+    }
+  }
+}

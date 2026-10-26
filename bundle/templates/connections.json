@@ -1,0 +1,27 @@
+{
+  "default": "test",
+  "connections": {
+    "dev": {
+      "host": "localhost:27017",
+      "database": "AppDb"
+    },
+    "test": {
+      "host": "mongotest01:27017",
+      "user": "app_user",
+      "password_env": "MONGO_PW_TEST",
+      "auth_source": "admin",
+      "database": "AppDb"
+    },
+    "prod": {
+      "host": "mongoprod01:27017,mongoprod02:27017,mongoprod03:27017",
+      "replica_set": "rs0",
+      "user": "report_user",
+      "password_env": "MONGO_PW_PROD",
+      "auth_source": "admin",
+      "database": "AppDb",
+      "read_preference": "secondaryPreferred",
+      "readonly": true,
+      "max_docs": 50
+    }
+  }
+}

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mongo-mcp-simple"
+version = "1.0.0"
+description = "MCP server for MongoDB (4.4+) for VS Code agents - queries, aggregation, writes, transactions, indexes, admin commands. Password, LDAP, Kerberos (Windows logon), x509 or URI authentication."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ohankay" }]
+keywords = ["mcp", "mongodb", "vscode", "copilot", "agent"]
+dependencies = [
+    "mcp>=1.10,<2",
+    "anyio>=4",
+    "pymongo>=4.6",
+    # mcp needs pywin32 (pywintypes) on Windows; declared explicitly so every install path gets it.
+    "pywin32>=306; sys_platform == 'win32'",
+    # Kerberos (GSSAPI) with the logged-on Windows user: auth "windows".
+    "winkerberos>=0.9; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "uv>=0.5", "packaging>=23"]
+
+[project.scripts]
+mongo-mcp = "mongo_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs a running MongoDB (MONGO_MCP_TEST_TARGETS)"]

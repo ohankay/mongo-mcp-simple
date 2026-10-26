@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongo8:
+        image: mongo:8.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: "Str0ng!Pass"
+        ports: ["27018:27017"]
+      mongo44:
+        image: mongo:4.4
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: "Str0ng!Pass"
+        ports: ["27044:27017"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start a single-node replica set (transactions)
+        run: |
+          docker run -d --name mongo-rs -p 27019:27019 mongo:8.0 --replSet rs0 --port 27019 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongo-rs mongosh --port 27019 --quiet --eval "db.adminCommand('ping')" && break
+            sleep 2
+          done
+          docker exec mongo-rs mongosh --port 27019 --quiet --eval "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27019'}]})"
+      - run: pip install --prefer-binary -e ".[dev]"
+      - name: Wait for MongoDB
+        run: |
+          python - <<'PY'
+          import time, pymongo
+          for uri in ("mongodb://root:Str0ng%21Pass@localhost:27018/", "mongodb://root:Str0ng%21Pass@localhost:27044/",
+                      "mongodb://localhost:27019/?replicaSet=rs0"):
+              for _ in range(60):
+                  try:
+                      c = pymongo.MongoClient(uri, serverSelectionTimeoutMS=2000)
+                      if c.admin.command("hello").get("isWritablePrimary"):
+                          break
+                  except Exception:
+                      pass
+                  time.sleep(2)
+              else:
+                  raise SystemExit(f"{uri} not ready")
+          PY
+      - name: Tests (MongoDB 8.0 + 4.4 + replica set)
+        env:
+          MONGO_MCP_TEST_TARGETS: "mongo8=mongodb://root:Str0ng%21Pass@localhost:27018/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
+          MONGO_MCP_TEST_RS: "mongodb://localhost:27019/?replicaSet=rs0"
+        run: pytest -v
+
+  unit-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, python: "3.12" }
+          - { arch: x64, python: "3.14" }
+          - { arch: x86, python: "3.14" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - run: pip install --prefer-binary -e ".[dev]"
+      - name: Dependency check (pywin32 / winkerberos / pymongo C extensions)
+        run: |
+          pip check
+          python -c "import pywintypes, winkerberos, click, mcp.server.fastmcp, struct, pymongo, bson; print('deps OK', struct.calcsize('P') * 8, 'bit', 'C ext:', pymongo.has_c(), bson.has_c())"
+      - run: pytest -v tests/test_unit.py tests/test_e2e_stdio.py

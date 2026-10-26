@@ -1,0 +1,18 @@
+{
+  "inputs": [
+    { "type": "promptString", "id": "mongo-password", "description": "MongoDB sifresi", "password": true }
+  ],
+  "servers": {
+    "mongo": {
+      "type": "stdio",
+      "command": "${userHome}\\.mongo-mcp\\Scripts\\mongo-mcp.exe",
+      "env": {
+        "MONGO_MCP_HOST": "SUNUCU:27017",
+        "MONGO_MCP_USER": "KULLANICI",
+        "MONGO_MCP_PASSWORD": "${input:mongo-password}",
+        "MONGO_MCP_AUTH_SOURCE": "admin",
+        "MONGO_MCP_DATABASE": "VERITABANI"
+      }
+    }
+  }
+}

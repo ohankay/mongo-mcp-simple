@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "mongo": {
+      "type": "stdio",
+      "command": "${userHome}\\.mongo-mcp\\Scripts\\mongo-mcp.exe",
+      "env": {
+        "MONGO_MCP_HOST": "SUNUCU.sirket.local:27017",
+        "MONGO_MCP_AUTH": "windows",
+        "MONGO_MCP_DATABASE": "VERITABANI"
+      }
+    }
+  }
+}

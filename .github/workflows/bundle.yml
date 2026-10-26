@@ -1,0 +1,114 @@
+name: Windows bundle
+
+# Tests the committed download packages on real Windows, for 64-bit and 32-bit Python:
+#   release/mongo-mcp-simple-windows-x64.zip, release/mongo-mcp-simple-windows-x86.zip
+# freshness vs. source, offline install with install.cmd on every supported Python, MCP stdio
+# smoke test and wrong-architecture detection.
+# Rebuild the zips with: pip install uv && python scripts/build_bundle.py
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["release/**", "bundle/**", "scripts/build_bundle.py", "src/**", "pyproject.toml",
+            ".github/workflows/bundle.yml"]
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The zips must contain the current source
+        shell: python
+        run: |
+          import io, pathlib, sys, zipfile
+          norm = lambda b: b.replace(b"\r\n", b"\n")
+          stale = []
+          for arch in ("x64", "x86"):
+              outer = zipfile.ZipFile(f"release/mongo-mcp-simple-windows-{arch}.zip")
+              names = outer.namelist()
+              if outer.read("mongo-mcp-simple/bundle_arch.txt").decode() != arch:
+                  stale.append(f"{arch}: bundle_arch.txt")
+              for f in ("install.cmd", "KURULUM_REHBERI.md"):
+                  if norm(outer.read(f"mongo-mcp-simple/{f}")) != norm(pathlib.Path("bundle", f).read_bytes()):
+                      stale.append(f"{arch}: {f}")
+              whl = next(n for n in names if n.startswith("mongo-mcp-simple/wheelhouse/mongo_mcp_simple-"))
+              inner = zipfile.ZipFile(io.BytesIO(outer.read(whl)))
+              for src in pathlib.Path("src/mongo_mcp").glob("*.py"):
+                  if norm(inner.read(f"mongo_mcp/{src.name}")) != norm(src.read_bytes()):
+                      stale.append(f"{arch}: {src}")
+          if stale:
+              sys.exit("zip is stale, run scripts/build_bundle.py: " + ", ".join(stale))
+          print("zips are up to date")
+
+  install-test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - name: Unzip
+        shell: pwsh
+        run: Expand-Archive release\mongo-mcp-simple-windows-${{ matrix.arch }}.zip -DestinationPath C:\bundle
+      - name: Offline install with install.cmd (no network to PyPI)
+        shell: cmd
+        env:
+          MONGO_MCP_HOME: C:\mongomcp
+          MONGO_MCP_PYTHON: python
+          PIP_INDEX_URL: http://127.0.0.1:9/blocked
+        run: |
+          cd /d C:\bundle\mongo-mcp-simple
+          call install.cmd
+          if errorlevel 1 exit /b 1
+      - name: Smoke test (CLI + MCP stdio handshake)
+        shell: pwsh
+        run: |
+          & C:\mongomcp\Scripts\mongo-mcp.exe --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & C:\mongomcp\Scripts\mongo-mcp.exe --check | Out-String | Write-Output
+          if ($LASTEXITCODE -ne 1) { Write-Error "--check without config must exit 1"; exit 1 }
+          @'
+          import asyncio, json, struct
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              params = StdioServerParameters(command=r"C:\mongomcp\Scripts\mongo-mcp.exe", args=[])
+              async with stdio_client(params) as (r, w), ClientSession(r, w) as s:
+                  await s.initialize()
+                  tools = {t.name for t in (await s.list_tools()).tools}
+                  assert len(tools) == 28, tools
+                  res = json.loads((await s.call_tool("find", {"collection": "x"})).content[0].text)
+                  assert res["success"] is False and "MONGO_MCP_HOST" in res["error"]["message"], res
+              print("stdio OK,", len(tools), "tools,", struct.calcsize("P") * 8, "bit")
+
+          asyncio.run(main())
+          '@ | Set-Content smoke.py
+          & C:\mongomcp\Scripts\python.exe smoke.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $info = & C:\mongomcp\Scripts\python.exe -c "import struct, sys; print('%d.%d-%d' % (sys.version_info[0], sys.version_info[1], struct.calcsize('P') * 8))"
+          $bits = if ("${{ matrix.arch }}" -eq "x86") { "32" } else { "64" }
+          if ($info -ne "${{ matrix.python }}-$bits") { Write-Error "venv is $info, expected ${{ matrix.python }}-$bits"; exit 1 }
+      - name: Wrong-architecture package is rejected with a clear message
+        shell: cmd
+        env:
+          MONGO_MCP_HOME: C:\mongomcp-wrong
+          MONGO_MCP_PYTHON: python
+        run: |
+          if "${{ matrix.arch }}"=="x64" (set OTHER=x86) else (set OTHER=x64)
+          powershell -Command "Expand-Archive release\mongo-mcp-simple-windows-%OTHER%.zip -DestinationPath C:\other"
+          cd /d C:\other\mongo-mcp-simple
+          call install.cmd
+          if not "%ERRORLEVEL%"=="14" ( echo expected exit code 14, got %ERRORLEVEL% & exit /b 1 )
+          echo wrong-architecture check OK
+          exit /b 0
