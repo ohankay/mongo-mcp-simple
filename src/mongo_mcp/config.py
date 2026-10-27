@@ -76,6 +76,8 @@ class MongoProfile:
     direct_connection: bool | None = None
     tls: bool = False
     tls_allow_invalid_certificates: bool = False
+    tls_allow_invalid_hostnames: bool = False
+    tls_insecure: bool = False          # test environments only: no certificate / host name verification
     tls_ca_file: str | None = None
     tls_certificate_key_file: str | None = None
     read_preference: str | None = None
@@ -120,9 +122,11 @@ class MongoProfile:
                 raise ConfigError(f"[{self.name}] 'port' must be <= 65535")
         if self.direct_connection is not None:
             self.direct_connection = _to_bool(self.direct_connection, "direct_connection")
-        for flag in ("tls", "tls_allow_invalid_certificates", "readonly", "fallback_direct"):
+        for flag in ("tls", "tls_allow_invalid_certificates", "tls_allow_invalid_hostnames", "tls_insecure",
+                     "readonly", "fallback_direct"):
             setattr(self, flag, _to_bool(getattr(self, flag), flag))
-        if self.tls_ca_file or self.tls_certificate_key_file:
+        if (self.tls_ca_file or self.tls_certificate_key_file or self.tls_insecure
+                or self.tls_allow_invalid_certificates or self.tls_allow_invalid_hostnames):
             self.tls = True
         if self.read_preference is not None:
             match = {p.lower(): p for p in READ_PREFERENCES}.get(str(self.read_preference).strip().lower())
@@ -188,7 +192,9 @@ _ENV_MAP = {
     "USERNAME": "user", "PASSWORD": "password", "AUTH_SOURCE": "auth_source",
     "AUTH_MECHANISM": "auth_mechanism", "DATABASE": "database", "REPLICA_SET": "replica_set",
     "DIRECT_CONNECTION": "direct_connection", "TLS": "tls",
-    "TLS_ALLOW_INVALID_CERTIFICATES": "tls_allow_invalid_certificates", "TLS_CA_FILE": "tls_ca_file",
+    "TLS_ALLOW_INVALID_CERTIFICATES": "tls_allow_invalid_certificates",
+    "TLS_ALLOW_INVALID_HOSTNAMES": "tls_allow_invalid_hostnames", "TLS_INSECURE": "tls_insecure",
+    "TLS_CA_FILE": "tls_ca_file",
     "TLS_CERTIFICATE_KEY_FILE": "tls_certificate_key_file", "READ_PREFERENCE": "read_preference",
     "READONLY": "readonly", "MAX_DOCS": "max_docs", "MAX_TIME_MS": "max_time_ms",
     "SERVER_SELECTION_TIMEOUT_MS": "server_selection_timeout_ms", "APP_NAME": "app_name",

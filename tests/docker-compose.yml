@@ -1,4 +1,5 @@
 # Test servers: docker compose -f tests/docker-compose.yml up -d
+# (TLS servers: first run `python tests/make_tls_certs.py tests/tls-certs`)
 # then initiate the replica set once:
 #   docker exec mongo-rs mongosh --port 27019 --quiet --eval "rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27019'}]})"
 services:
@@ -25,3 +26,21 @@ services:
     container_name: mongo-rs
     command: ["--replSet", "rs0", "--port", "27019", "--bind_ip_all"]
     ports: ["27019:27019"]
+  mongo-tls:
+    image: mongo:8.2
+    command: ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", "/certs/server.pem", "--tlsCAFile", "/certs/ca.pem",
+              "--tlsAllowConnectionsWithoutCertificates", "--bind_ip_all"]
+    volumes: ["./tls-certs:/certs:ro"]
+    ports: ["27060:27017"]
+  mongo-tls-wronghost:
+    image: mongo:8.2
+    command: ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", "/certs/wronghost.pem", "--tlsCAFile", "/certs/ca.pem",
+              "--tlsAllowConnectionsWithoutCertificates", "--bind_ip_all"]
+    volumes: ["./tls-certs:/certs:ro"]
+    ports: ["27061:27017"]
+  mongo-tls-mtls:
+    image: mongo:8.2
+    command: ["--tlsMode", "requireTLS", "--tlsCertificateKeyFile", "/certs/server.pem", "--tlsCAFile", "/certs/ca.pem",
+              "--bind_ip_all"]
+    volumes: ["./tls-certs:/certs:ro"]
+    ports: ["27063:27017"]

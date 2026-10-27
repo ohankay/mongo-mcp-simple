@@ -54,6 +54,20 @@ jobs:
           done
           docker exec mongo-bad mongosh --port 27039 --quiet --eval "rs.initiate({_id:'rs2',members:[{_id:0,host:'localhost:27039'}]})"
       - run: pip install --prefer-binary -e ".[dev]"
+      - name: Start TLS servers (test certificates)
+        run: |
+          python tests/make_tls_certs.py "$RUNNER_TEMP/tls"
+          tls() { docker run -d --name "$1" -p "$2:27017" -v "$RUNNER_TEMP/tls:/certs:ro" mongo:8.2 mongod --bind_ip_all \
+                    --tlsMode requireTLS --tlsCertificateKeyFile "/certs/$3" --tlsCAFile /certs/ca.pem $4; }
+          tls mongo-tls 27060 server.pem --tlsAllowConnectionsWithoutCertificates
+          tls mongo-tls-wronghost 27061 wronghost.pem --tlsAllowConnectionsWithoutCertificates
+          tls mongo-tls-mtls 27063 server.pem
+          for i in $(seq 1 30); do
+            python -c "import pymongo; pymongo.MongoClient('mongodb://localhost:27063/', tls=True, tlsCAFile='$RUNNER_TEMP/tls/ca.pem', tlsCertificateKeyFile='$RUNNER_TEMP/tls/client.pem', serverSelectionTimeoutMS=2000).admin.command('ping')" && \
+            python -c "import pymongo; [pymongo.MongoClient(f'mongodb://localhost:{p}/', tls=True, tlsInsecure=True, serverSelectionTimeoutMS=2000).admin.command('ping') for p in (27060, 27061)]" && break
+            sleep 2
+          done
+          docker ps -a
       - name: Wait for MongoDB
         run: |
           python - <<'PY'
@@ -72,12 +86,14 @@ jobs:
               else:
                   raise SystemExit(f"{uri} not ready")
           PY
-      - name: Tests (MongoDB 8.2 + 7.0 + 4.4 + replica set)
+      - name: Tests (MongoDB 8.2 + 7.0 + 4.4 + replica set + TLS)
         env:
           MONGO_MCP_TEST_TARGETS: "mongo82=mongodb://root:Str0ng%21Pass@localhost:27082/;mongo70=mongodb://root:Str0ng%21Pass@localhost:27070/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
           MONGO_MCP_TEST_RS: "mongodb://localhost:27019/?replicaSet=rs0"
           MONGO_MCP_TEST_BAD_RS: "mongodb://localhost:27049/?replicaSet=rs2"
-        run: pytest -v
+        run: |
+          export MONGO_MCP_TEST_TLS="dir=$RUNNER_TEMP/tls;good=localhost:27060;wronghost=localhost:27061;mtls=localhost:27063"
+          pytest -v
 
   unit-windows:
     runs-on: windows-latest
@@ -99,4 +115,4 @@ jobs:
         run: |
           pip check
           python -c "import pywintypes, winkerberos, click, mcp.server.fastmcp, struct, pymongo, bson; print('deps OK', struct.calcsize('P') * 8, 'bit', 'C ext:', pymongo.has_c(), bson.has_c())"
-      - run: pytest -v tests/test_unit.py tests/test_e2e_stdio.py
+      - run: pytest -v tests/test_unit.py tests/test_tls.py tests/test_e2e_stdio.py

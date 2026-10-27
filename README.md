@@ -129,7 +129,9 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
 | `MONGO_MCP_REPLICA_SET` | `replica_set` | | Replica set adı |
 | `MONGO_MCP_DIRECT_CONNECTION` | `direct_connection` | | Replica set'te tek üyeye doğrudan bağlan |
 | `MONGO_MCP_TLS` | `tls` | `false` | TLS (Atlas için URI zaten içerir) |
-| `MONGO_MCP_TLS_ALLOW_INVALID_CERTIFICATES` | `tls_allow_invalid_certificates` | `false` | Şirket içi self-signed sertifikalar |
+| `MONGO_MCP_TLS_INSECURE` | `tls_insecure` | `false` | **Yalnızca test ortamları:** TLS sertifika ve sunucu adı doğrulamasını tamamen kapatır (TLS'i de açar). Trafik şifreli kalır ama sunucunun kimliği doğrulanmaz |
+| `MONGO_MCP_TLS_ALLOW_INVALID_CERTIFICATES` | `tls_allow_invalid_certificates` | `false` | Yalnızca sertifika zinciri doğrulamasını kapatır (test) |
+| `MONGO_MCP_TLS_ALLOW_INVALID_HOSTNAMES` | `tls_allow_invalid_hostnames` | `false` | Yalnızca sunucu adı kontrolünü kapatır, sertifika doğrulaması sürer (test) |
 | `MONGO_MCP_TLS_CA_FILE` / `MONGO_MCP_TLS_CERTIFICATE_KEY_FILE` | `tls_ca_file` / `tls_certificate_key_file` | | CA dosyası / x509 istemci sertifikası |
 | `MONGO_MCP_READ_PREFERENCE` | `read_preference` | | `primary`, `secondaryPreferred`, ... |
 | `MONGO_MCP_READONLY` | `readonly` | `false` | Yazma tool'larını ve yazan komutları engeller |
@@ -153,6 +155,13 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
   * `servers`: her sunucunun sürücü tarafından görülen durumu, gecikmesi ve son hatası.
   * `events`: hatadan kısa süre önce kaydedilen sürücü olayları (zaman ve sunucu adresiyle): `heartbeat_failed`, `server_changed`, `pool_cleared` (`interrupted_in_use_connections` ile), `connection_check_out_failed`, `command_failed`. Komut içeriği ve kimlik bilgisi kaydedilmez.
   * `_OperationCancelled`: sürücü, kullandığı sunucunun bağlantı havuzunu işlem sürerken temizlediği için işlemi iptal etti demektir; nedeni `events` içindeki `heartbeat_failed` / `pool_cleared` kayıtlarında görülür.
+* **TLS doğrulamasını kapatma (yalnızca test):** profile `"tls_insecure": true` ekleyin (ortam değişkeni `MONGO_MCP_TLS_INSECURE=true`, ya da URI sonuna `&tls=true&tlsInsecure=true`). TLS'i de açar; URI'deki diğer `tlsAllowInvalid*` seçenekleriyle çakışmaz.
+* **TLS / SSL sorunları:** TLS kaynaklı bir bağlantı hatasında mesaj `TLS/SSL problem (sunucu:port): ...` ile başlar ve yanıtta `tls` alanı döner:
+  * `problem`: `untrusted_certificate` (CA tanınmıyor / self-signed), `hostname_mismatch`, `certificate_expired`, `certificate_not_yet_valid`, `weak_certificate`, `client_certificate_required`, `client_certificate_rejected`, `client_certificate_file`, `server_requires_tls` (profilde TLS yok ama sunucu istiyor), `server_not_tls` (profilde TLS var ama sunucu kullanmıyor), `protocol_mismatch`, `handshake_failed`.
+  * `server`, `summary`, `driver_detail` (OpenSSL'in özgün mesajı), `how_to_fix` (yapılacaklar), `settings` (profilin etkin TLS ayarları).
+  * `evidence`: sunucuya kimlik bilgisi göndermeden yapılan tek bir TLS el sıkışmasının sonucu: sunucu TLS konuşuyor mu, protokol, şifre takımı ve sunucu sertifikası (subject, issuer, sertifikadaki adlar, geçerlilik tarihleri, süresi dolmuş mu, SHA-256 parmak izi).
+  * Sertifika sorunlarında `test_only_workaround`: `tls_insecure` ile nasıl geçileceği. Tüm sunucular TLS hatası veriyorsa doğrudan bağlanma denemesi (direct fallback) yapılmaz, hata hemen döner.
+  * `tls_insecure` / `tls_allow_invalid_*` açık profillerde `test_connection` çıktısında `tls.verification` ve `tls.warning`, `list_connections` çıktısında `tls_warning` görünür.
 * **Yeniden deneme politikası:** Okuma araçları (`find`, `aggregate`, `count_documents`, `list_*` ...) ağ hatası alırsa istemci kapatılıp **yeni bir istemciyle bir kez** tekrar denenir; başarılı olursa yanıtta `retried_after` alanı ilk hatayı ve olaylarını gösterir. Yazma araçları ve `run_command` **asla otomatik tekrarlanmaz**: komut çalışırken bağlantı koptuysa yanıtta `write_outcome: "unknown"` döner, yazmanın uygulanıp uygulanmadığını tekrar etmeden önce kontrol edin. Her ağ hatasından sonra istemci sıfırlanır, aynı aracı tekrar çağırmak yeni bağlantıyla başlar.
 * **Okuma tercihi:** `list_databases`, `list_collections`, `collection_stats`, `list_indexes` artık profilin `readPreference` ayarına uyar (eskiden primary'ye gidiyordu); `secondaryPreferred` profilinde primary erişilemezken de çalışırlar.
 * **Çalışan sürümü doğrulama:** `test_connection` çıktısındaki `runtime` alanı çalışan MCP sürecinin sürümünü, `pid`'ini, başlama zamanını, Python sürümü/bitliğini ve modül yolunu gösterir. Güncellemeden sonra eski davranış görüyorsanız VS Code'da MCP sunucusunu yeniden başlatın ("MCP: List Servers" → mongo → Restart) ve `runtime.mongo_mcp` sürümünü kontrol edin. Ayrıca `members_seen` ve `primary_reachable` alanları replica set'te hangi üyelerin görüldüğünü gösterir.

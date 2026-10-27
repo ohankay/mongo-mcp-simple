@@ -11,3 +11,4 @@ htmlcov/
 # local secrets / personal configs
 *.local.json
 .env
+tests/tls-certs/

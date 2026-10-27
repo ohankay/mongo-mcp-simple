@@ -144,7 +144,7 @@ def test_manager_errors():
 
 # ---------------------------------------------------------------- client kwargs
 
-def test_client_kwargs_per_auth():
+def test_client_kwargs_per_auth(tmp_path):
     host, kw = client_kwargs(MongoProfile(name="a", host="h1:27017,h2:27017", user="u", password="p",
                                           replica_set="rs0", read_preference="secondarypreferred"))
     assert host == ["h1:27017", "h2:27017"] and kw["authSource"] == "admin" and kw["replicaSet"] == "rs0"
@@ -160,8 +160,10 @@ def test_client_kwargs_per_auth():
     assert kw["username"] == "svc@REALM"
     with pytest.raises(ConfigError, match="USERDNSDOMAIN"):
         client_kwargs(MongoProfile(name="a", host="h", auth="windows"), env={"USERNAME": "jdoe"})
-    _, kw = client_kwargs(MongoProfile(name="a", host="h", auth="x509", tls_certificate_key_file="c.pem"))
-    assert kw["authMechanism"] == "MONGODB-X509" and kw["tls"] is True and kw["tlsCertificateKeyFile"] == "c.pem"
+    pem = tmp_path / "c.pem"
+    pem.write_text("x")
+    _, kw = client_kwargs(MongoProfile(name="a", host="h", auth="x509", tls_certificate_key_file=str(pem)))
+    assert kw["authMechanism"] == "MONGODB-X509" and kw["tls"] is True and kw["tlsCertificateKeyFile"] == str(pem)
     _, kw = client_kwargs(MongoProfile(name="a", host="h", tls=True, tls_allow_invalid_certificates=True,
                                        direct_connection=True))
     assert kw["tlsAllowInvalidCertificates"] is True and kw["directConnection"] is True

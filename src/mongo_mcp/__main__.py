@@ -14,7 +14,7 @@ def _check(connection: str | None) -> int:
     from .client import ClientManager
     from .config import load_profiles
     from .errors import is_network_error
-    from .server import _error, _server_info, _topology, set_manager
+    from .server import _error, _server_info, _tls_file_error, _topology, add_tls_diagnosis, set_manager
 
     try:
         import pymongo
@@ -43,6 +43,9 @@ def _check(connection: str | None) -> int:
                 info["error"]["stage"] = getattr(exc, "mcp_stage", "operation")
                 info["error"]["servers"] = _topology(name)
                 info["error"]["events"] = mgr.events(name)
+                add_tls_diagnosis(info["error"], exc, name, info["error"]["servers"])
+            elif _tls_file_error(exc):
+                add_tls_diagnosis(info["error"], exc, name, None)
         ok = ok and bool(info.get("success"))
         report["connections"][name] = info
     mgr.close_all()

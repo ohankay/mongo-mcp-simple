@@ -4,6 +4,7 @@ Integration tests run against every server in ``MONGO_MCP_TEST_TARGETS`` (``name
 
     MONGO_MCP_TEST_TARGETS="mongo82=mongodb://root:Str0ng%21Pass@localhost:27082/;mongo70=mongodb://root:Str0ng%21Pass@localhost:27070/;mongo44=mongodb://root:Str0ng%21Pass@localhost:27044/"
     MONGO_MCP_TEST_RS="mongodb://localhost:27019/?replicaSet=rs0"     # replica set, for transaction tests
+    MONGO_MCP_TEST_TLS="dir=tests/tls-certs;good=localhost:27060;wronghost=localhost:27061;mtls=localhost:27063"
 
 Start the servers with ``docker compose -f tests/docker-compose.yml up -d`` (see that file).
 """

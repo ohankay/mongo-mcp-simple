@@ -56,7 +56,7 @@ Kullanıcıya şu soruları tek mesajda sor (şifre SORMA):
    - `none`: kimlik doğrulama yok (yerel geliştirme)
 3. **Kullanıcı adı ve `auth_source`:** kullanıcının oluşturulduğu veritabanı; bilinmiyorsa `admin`.
 4. **Varsayılan veritabanı** (tool'larda `database` verilmezse kullanılır).
-5. **TLS gerekli mi?** (Atlas ve bazı kurumsal sunucular). Şirket içi sertifika güvenilir değilse `tls_allow_invalid_certificates`.
+5. **TLS gerekli mi?** (Atlas ve bazı kurumsal sunucular). Şirketin CA sertifikası (.pem) varsa `tls_ca_file`. **Yalnızca test ortamında** ve kullanıcı açıkça isterse sertifika doğrulamasını kapatmak için `"tls_insecure": true` (ortam değişkeni `MONGO_MCP_TLS_INSECURE=true`). Prod bağlantılarında `tls_insecure` kullanma.
 6. **Salt okunur mu?** Prod için `evet` önerilir.
 7. **Birden fazla sunucu mu?** Evetse her biri için 1–6 tekrarlanır ve her birine kısa bir ad verilir (`test`, `prod`, ...).
 
@@ -127,6 +127,7 @@ Kurulum burada biter.
 | `environment variable 'MONGO_PW_...' is not set` | `connections.json` içindeki `password_env` adı `mcp.json` `env` bölümünde yok veya farklı yazılmış. İki dosyadaki adı aynı yapın, sunucuyu **Restart** edin. |
 | `USERDNSDOMAIN` hatası (`windows` tipi) | Bilgisayar domain'de değil. `user` alanına Kerberos principal'ınızı yazın: `kullanici@SIRKET.LOCAL`. |
 | `_OperationCancelled` / `Lost the connection` | Sürücü, kullandığı sunucunun bağlantı havuzunu işlem sürerken temizledi (genelde o sunucuya heartbeat/bağlantı başarısız oldu). Hata yanıtındaki `stage` (`connect`/`operation`), `events` (`heartbeat_failed`, `pool_cleared`, `command_failed` ... zaman ve adresle) ve `servers` alanlarına bakın; sorunlu sunucu adresi orada görünür. Okumalar yeni istemciyle bir kez otomatik tekrar denenir; yazmalar tekrarlanmaz (`write_outcome: "unknown"` ise yazmanın uygulanıp uygulanmadığını kontrol edin). |
+| `TLS/SSL problem ...` | Yanıttaki `tls.problem`, `tls.summary` ve `tls.how_to_fix` alanlarını kullanıcıya aynen aktar; `tls.evidence.certificate` sunucunun sertifikasını (issuer, adlar, geçerlilik) gösterir. Sık görülenler: `untrusted_certificate` → `tls_ca_file` ile şirket CA'sını ver; `hostname_mismatch` → sertifikadaki adlardan biriyle bağlan; `server_requires_tls` → `"tls": true` ekle; `server_not_tls` → `tls`'i kaldır; `client_certificate_required` → `tls_certificate_key_file`. Test ortamında sertifika sorunlarını geçmek için `"tls_insecure": true`. |
 | Güncelleme sonrası eski davranış | Eski MCP süreci çalışıyor olabilir. `test_connection` çıktısındaki `runtime.mongo_mcp` sürümünü ve `pid`'i kontrol edin; VS Code'da "MCP: List Servers" → mongo → Restart yapın. |
 | `WinError 10061` / `Replica set is configured with internal hostnames` | Replica set üyeleri kendini bilgisayarınızdan erişilemeyen adreslerle bildiriyor. 1.0.2 ile bağlantı adresindeki sunucular sırayla doğrudan denenir (`direct_fallback`); eski kurulumu güncelleyin. Tüm sunucular reddediyorsa port ve sunucu adlarını DBA ile teyit edin. |
 | `not authorized` (kod 13) | Kullanıcının bu işlem/veritabanı için yetkisi yok. |

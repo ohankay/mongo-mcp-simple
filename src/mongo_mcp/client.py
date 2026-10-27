@@ -8,6 +8,7 @@ import threading
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode
 
+from . import tls as tls_mod
 from .config import (AUTH_LDAP, AUTH_NONE, AUTH_SCRAM, AUTH_URI, AUTH_WINDOWS, AUTH_X509, ConfigError,
                      MongoProfile)
 
@@ -80,12 +81,23 @@ def client_kwargs(profile: MongoProfile, env: Mapping[str, str] | None = None) -
         kw["directConnection"] = profile.direct_connection
     if profile.tls:
         kw["tls"] = True
-        if profile.tls_allow_invalid_certificates:
-            kw["tlsAllowInvalidCertificates"] = True
-        if profile.tls_ca_file:
-            kw["tlsCAFile"] = profile.tls_ca_file
-        if profile.tls_certificate_key_file:
-            kw["tlsCertificateKeyFile"] = profile.tls_certificate_key_file
+        uri_opts = tls_mod.uri_options(profile)
+        if "tlsinsecure" in uri_opts:
+            # the driver refuses tlsInsecure together with tlsAllowInvalid*: only override that one option
+            if profile.tls_insecure:
+                kw["tlsInsecure"] = True
+        else:
+            if profile.tls_insecure or profile.tls_allow_invalid_certificates:
+                kw["tlsAllowInvalidCertificates"] = True
+            if profile.tls_insecure or profile.tls_allow_invalid_hostnames:
+                kw["tlsAllowInvalidHostnames"] = True
+        for setting, option in (("tls_ca_file", "tlsCAFile"), ("tls_certificate_key_file", "tlsCertificateKeyFile")):
+            path = getattr(profile, setting)
+            if path:
+                if not os.path.isfile(path):
+                    raise ConfigError(f"[{profile.name}] {setting} '{path}' does not exist (in JSON escape "
+                                      "backslashes: \"C:\\\\certs\\\\file.pem\")")
+                kw[option] = path
     if profile.read_preference:
         kw["readPreference"] = profile.read_preference
     return host, kw
@@ -104,6 +116,22 @@ def seed_hosts(profile: MongoProfile) -> list[str]:
     if profile.port and len(out) == 1 and ":" not in out[0]:
         out = [f"{out[0]}:{profile.port}"]
     return out
+
+
+def server_states(cli: Any) -> list[dict[str, Any]]:
+    """Per-server state as the driver sees it (type, round trip, last error)."""
+    servers: list[dict[str, Any]] = []
+    topology = getattr(cli, "topology_description", None)
+    if topology is None:
+        return servers
+    for sd in topology.server_descriptions().values():
+        entry: dict[str, Any] = {"address": f"{sd.address[0]}:{sd.address[1]}", "type": sd.server_type_name}
+        if sd.round_trip_time is not None:
+            entry["round_trip_ms"] = round(sd.round_trip_time * 1000, 1)
+        if sd.error is not None:
+            entry["error"] = str(sd.error)[:500]
+        servers.append(entry)
+    return servers
 
 
 def direct_profile(profile: MongoProfile, host: str) -> MongoProfile:
@@ -237,7 +265,14 @@ class ClientManager:
             except (pe.AutoReconnect, pe.NetworkTimeout) as exc:
                 # e.g. _OperationCancelled: the pool was cleared during the probe - try once more, then fall back
                 first_error = exc
+        states = server_states(cli)
         cli.close()
+        errors = [e["error"] for e in states if e.get("error")] or [str(first_error)]
+        if all(tls_mod.is_tls_error(e) for e in errors):
+            # every server failed the TLS handshake: direct connections use the same certificates, so the fallback
+            # cannot help - keep the per-server TLS errors for the diagnosis instead
+            self._last_failure[key] = states
+            raise first_error  # type: ignore[misc]
         tried: list[str] = []
         failures: list[dict[str, Any]] = []
         for host in seed_hosts(prof):
@@ -334,6 +369,9 @@ class ClientManager:
             info["client_open"] = name in self._clients  # opened on first use; not a health check
             if name in self._fallback:
                 info["direct_fallback"] = self._fallback[name]
+            tls = tls_mod.settings(prof)
+            if tls.get("warning"):
+                info["tls_warning"] = tls["warning"]
             out.append(info)
         for name, err in self._broken.items():
             out.append({"name": name, "broken": True, "error": err})

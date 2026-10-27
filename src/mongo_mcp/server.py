@@ -16,10 +16,11 @@ from mcp.types import ToolAnnotations
 
 from .bsonutil import (MAX_RESPONSE_CHARS, ReadOnlyViolation, check_command_readonly, check_pipeline_readonly,
                        collect_documents, parse_ejson, to_jsonable)
-from .client import ClientManager
+from .client import ClientManager, server_states
 from .config import ConfigError, load_profiles, profile_from_mapping
 from . import __version__
 from .errors import describe_error, is_network_error
+from . import tls as tls_mod
 
 log = logging.getLogger("mongo_mcp")
 
@@ -71,17 +72,34 @@ def _topology(connection: str | None) -> list[dict[str, Any]] | None:
         cli = manager().existing_client(connection)
         if cli is None:
             return manager().last_failure(connection)
-        servers = []
-        for sd in cli.topology_description.server_descriptions().values():
-            entry: dict[str, Any] = {"address": f"{sd.address[0]}:{sd.address[1]}", "type": sd.server_type_name}
-            if sd.round_trip_time is not None:
-                entry["round_trip_ms"] = round(sd.round_trip_time * 1000, 1)
-            if sd.error is not None:
-                entry["error"] = str(sd.error)[:500]
-            servers.append(entry)
-        return servers
+        return server_states(cli)
     except Exception:  # noqa: BLE001 - diagnostics are best effort
         return None
+
+
+def _tls_file_error(exc: BaseException) -> bool:
+    from pymongo import errors as pe
+
+    return isinstance(exc, (FileNotFoundError, pe.ConfigurationError))
+
+
+def tls_diagnosis(exc: BaseException, connection: str | None,
+                  servers: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Detailed TLS/SSL diagnosis when the error is TLS related (server, problem, evidence, how to fix)."""
+    try:
+        return tls_mod.diagnose(exc, manager().profile(connection), servers)
+    except Exception:  # noqa: BLE001 - diagnostics are best effort
+        log.debug("tls diagnosis failed", exc_info=True)
+        return None
+
+
+def add_tls_diagnosis(err: dict[str, Any], exc: BaseException, connection: str | None,
+                      servers: list[dict[str, Any]] | None) -> None:
+    info = tls_diagnosis(exc, connection, servers)
+    if info:
+        where = f" ({info['server']})" if info.get("server") else ""
+        err["message"] = f"TLS/SSL problem{where}: {info['summary']} See 'tls' for the evidence and how to fix it."
+        err["tls"] = info
 
 
 def _retryable(exc: BaseException) -> bool:
@@ -129,11 +147,14 @@ async def _call(fn: Callable[[], Any], connection: str | None = None, kind: str 
                     events = manager().events(connection)
                     if events:
                         err["events"] = events
+                    add_tls_diagnosis(err, exc, connection, topo)
                     if retried:
                         err["retried"] = True
                     if kind == "write" and err["stage"] == "operation":
                         err["write_outcome"] = WRITE_OUTCOME_UNKNOWN
                     manager().reset(connection)  # next call reconnects and re-probes the replica set
+                elif _tls_file_error(exc):
+                    add_tls_diagnosis(out["error"], exc, connection, None)
                 return out
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -269,6 +290,7 @@ def _server_info(connection: str | None) -> dict[str, Any]:
     types = [sd.server_type_name for sd in cli.topology_description.server_descriptions().values()]
     info["server"]["members_seen"] = types
     info["server"]["primary_reachable"] = any(t in ("RSPrimary", "Standalone", "Mongos") for t in types)
+    info["server"]["tls"] = tls_mod.settings(prof)
     info["runtime"] = runtime_info()
     if fallback:
         info["server"]["direct_fallback"] = fallback
@@ -300,20 +322,23 @@ async def add_connection(name: str, host: str | None = None, uri: str | None = N
                          user: str | None = None, password_env: str | None = None, auth_source: str | None = None,
                          database: str | None = None, replica_set: str | None = None,
                          direct_connection: bool | None = None, tls: bool = False,
-                         tls_allow_invalid_certificates: bool = False, readonly: bool = False,
+                         tls_allow_invalid_certificates: bool = False, tls_insecure: bool = False,
+                         tls_ca_file: str | None = None, readonly: bool = False,
                          make_default: bool = False) -> str:
     """Register (or replace) a connection profile at runtime and test it.
 
     host: "srv01", "srv01:27017" or "h1:27017,h2:27017"; or uri: "mongodb://..." / "mongodb+srv://...".
     auth: none | scram (user+password) | ldap | windows (Kerberos with the Windows logon) | x509 | uri.
     Passwords are never passed here: use password_env (name of an environment variable set in mcp.json).
+    tls_insecure: TLS without certificate / host name verification - test environments only.
     """
     def run():
         data: dict[str, Any] = {k: v for k, v in {
             "host": host, "uri": uri, "auth": auth, "user": user, "password_env": password_env,
             "auth_source": auth_source, "database": database, "replica_set": replica_set,
-            "direct_connection": direct_connection}.items() if v is not None}
-        data.update(tls=tls, tls_allow_invalid_certificates=tls_allow_invalid_certificates, readonly=readonly)
+            "direct_connection": direct_connection, "tls_ca_file": tls_ca_file}.items() if v is not None}
+        data.update(tls=tls, tls_allow_invalid_certificates=tls_allow_invalid_certificates, tls_insecure=tls_insecure,
+                    readonly=readonly)
         manager().add(profile_from_mapping(name, data), make_default=make_default)
         info = _server_info(name)
         info["added"] = name
