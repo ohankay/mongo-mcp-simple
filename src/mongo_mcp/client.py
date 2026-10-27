@@ -134,10 +134,12 @@ def _wants_fallback(profile: MongoProfile) -> bool:
     return bool(seed_hosts(profile))
 
 
-def open_client(profile: MongoProfile) -> Any:
+def open_client(profile: MongoProfile, listeners: list[Any] | None = None) -> Any:
     import pymongo
 
     host, kw = client_kwargs(profile)
+    if listeners:
+        kw["event_listeners"] = listeners
     return pymongo.MongoClient(host, **kw)
 
 
@@ -152,6 +154,7 @@ class ClientManager:
         self._clients: dict[str, Any] = {}
         self._fallback: dict[str, dict[str, Any]] = {}
         self._last_failure: dict[str, list[dict[str, Any]]] = {}
+        self._events: dict[str, Any] = {}
         self._opener = opener
         # Probing needs real clients; injected test openers skip it unless asked.
         self._probe = (opener is open_client) if probe is None else probe
@@ -190,29 +193,55 @@ class ClientManager:
         with self._lock:
             cli = self._clients.get(key)
             if cli is None:
-                cli = self._connect(key, self._profiles[key])
+                try:
+                    cli = self._connect(key, self._profiles[key])
+                except Exception as exc:
+                    exc.mcp_stage = "connect"  # type: ignore[attr-defined] - failed while opening, not in the operation
+                    raise
                 self._clients[key] = cli
             return cli
+
+    def _open(self, key: str, prof: MongoProfile) -> Any:
+        if self._opener is open_client:
+            from .events import EventRecorder
+
+            recorder = self._events.setdefault(key, EventRecorder())
+            return open_client(prof, listeners=[recorder])
+        return self._opener(prof)
+
+    def events(self, name: str | None, seconds: float = 120.0) -> list[dict[str, Any]]:
+        """Driver events recorded for this profile in the last `seconds` (heartbeat failures, pool clears...)."""
+        try:
+            recorder = self._events.get(self._resolve(name))
+        except ConfigError:
+            return []
+        return recorder.recent(seconds) if recorder is not None else []
 
     def _connect(self, key: str, prof: MongoProfile) -> Any:
         """Open the normal (replica-set aware) client. If no member suitable for the profile's read preference
         can be reached - typically because the replica set advertises internal host names or ports - try the
         hosts listed by the user one by one with a direct connection and keep the first that answers."""
-        cli = self._opener(prof)
+        cli = self._open(key, prof)
         if not (self._probe and _wants_fallback(prof)):
             return cli
         from pymongo import errors as pe
 
-        try:
-            cli.admin.command("ping", read_preference=cli.read_preference)
-            return cli
-        except pe.ServerSelectionTimeoutError as exc:
-            first_error = exc
+        first_error: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                cli.admin.command("ping", read_preference=cli.read_preference)
+                return cli
+            except pe.ServerSelectionTimeoutError as exc:
+                first_error = exc
+                break  # already waited the full selection timeout
+            except (pe.AutoReconnect, pe.NetworkTimeout) as exc:
+                # e.g. _OperationCancelled: the pool was cleared during the probe - try once more, then fall back
+                first_error = exc
         cli.close()
         tried: list[str] = []
         failures: list[dict[str, Any]] = []
         for host in seed_hosts(prof):
-            direct = self._opener(direct_profile(prof, host))
+            direct = self._open(key, direct_profile(prof, host))
             try:
                 hello = direct.admin.command("hello")
             except pe.OperationFailure:
@@ -228,14 +257,14 @@ class ClientManager:
                 "address": host,
                 "role": "primary" if hello.get("isWritablePrimary") else (
                     "secondary" if hello.get("secondary") else "other"),
-                "reason": str(first_error).split(", Timeout")[0][:300],
+                "reason": (str(first_error).split(", Timeout")[0][:300] or type(first_error).__name__),
             }
             self._last_failure.pop(key, None)
             return direct
         self._last_failure[key] = failures
         raise pe.ServerSelectionTimeoutError(
-            f"{str(first_error).split(', Timeout')[0]}. Direct connection to each listed host also failed: "
-            + "; ".join(tried))
+            f"{str(first_error).split(', Timeout')[0] or type(first_error).__name__}. Direct connection to each "
+            "listed host also failed: " + "; ".join(tried))
 
     def last_failure(self, name: str | None) -> list[dict[str, Any]] | None:
         """Per-host results of the last connection attempt that failed completely."""

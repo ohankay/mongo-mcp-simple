@@ -43,10 +43,12 @@ def describe_error(exc: BaseException) -> dict[str, Any]:
         return info
     if type(exc).__name__ == "_OperationCancelled" or (isinstance(exc, pe.AutoReconnect)
                                                         and not str(exc).strip(" .").replace("operation cancelled", "")):
+        # Deliberately no guess about the cause: the recorded driver events ('events') are the evidence.
         info["message"] = (
-            "The driver cancelled the operation because its connection to the server was reset (a network error or "
-            "timeout seen by the server monitor - typical with firewalls/VPNs that cut long-lived connections, or "
-            "an unreachable replica set member). See 'servers' for each member's state and last error.")
+            "The MongoDB driver cancelled this operation: the connection pool of the server it was using was "
+            "cleared while the operation was in progress (the driver does this after a failed heartbeat or "
+            "connection to that server). 'events' lists the driver events recorded shortly before the error and "
+            "'servers' the topology at the time of the error.")
         return info
     if isinstance(exc, pe.AutoReconnect):
         info["message"] = "Lost the connection to the server: " + (str(exc)[:500] or type(exc).__name__)

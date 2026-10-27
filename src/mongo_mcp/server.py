@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
+import os
+import struct
+import sys
 from typing import Any, Callable
 
 import anyio
@@ -14,6 +18,7 @@ from .bsonutil import (MAX_RESPONSE_CHARS, ReadOnlyViolation, check_command_read
                        collect_documents, parse_ejson, to_jsonable)
 from .client import ClientManager
 from .config import ConfigError, load_profiles, profile_from_mapping
+from . import __version__
 from .errors import describe_error, is_network_error
 
 log = logging.getLogger("mongo_mcp")
@@ -35,6 +40,9 @@ mcp = FastMCP("mongo-mcp", instructions=INSTRUCTIONS)
 _manager: ClientManager | None = None
 _EXPECTED_ERRORS = (ConfigError, ReadOnlyViolation, ValueError)
 HARD_DOC_LIMIT = 10000
+_STARTED_AT = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+WRITE_OUTCOME_UNKNOWN = ("unknown - the connection failed while the write was in flight, so it may or may not have "
+                         "been applied; check with a read before retrying")
 
 
 def manager() -> ClientManager:
@@ -76,22 +84,58 @@ def _topology(connection: str | None) -> list[dict[str, Any]] | None:
         return None
 
 
-async def _call(fn: Callable[[], Any], connection: str | None = None) -> str:
+def _retryable(exc: BaseException) -> bool:
+    """Transient connection loss (incl. _OperationCancelled) - not a full server-selection timeout."""
+    from pymongo import errors as pe
+
+    return isinstance(exc, (pe.AutoReconnect, pe.NetworkTimeout)) and not isinstance(
+        exc, pe.ServerSelectionTimeoutError) and getattr(exc, "mcp_stage", None) != "connect"
+
+
+async def _call(fn: Callable[[], Any], connection: str | None = None, kind: str = "read") -> str:
+    """Run a tool body in a worker thread and turn exceptions into structured errors.
+
+    kind="read": a transient network error is retried once on a fresh client (reads are idempotent). kind="write":
+    never retried,
+    a network error reports that the outcome is unknown. kind="meta": no retry. After a final network error the
+    cached client is dropped, so the next call reconnects and re-probes the replica set (incl. direct fallback).
+    """
     def guarded() -> Any:
-        try:
-            result = fn()
-            if isinstance(result, dict) and "success" not in result:
-                result = {"success": True, **result}
-            return result
-        except Exception as exc:  # noqa: BLE001 - reported to the model as a structured error
-            out = _error(exc)
-            if is_network_error(exc):
-                topo = _topology(connection)
-                if topo:
-                    out["error"]["servers"] = topo
-                if type(exc).__name__ == "ServerSelectionTimeoutError":
+        retried: dict[str, Any] | None = None
+        attempts = 2 if kind == "read" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                result = fn()
+                if isinstance(result, dict) and "success" not in result:
+                    result = {"success": True, **result}
+                if retried and isinstance(result, dict):
+                    result["retried_after"] = retried
+                return result
+            except Exception as exc:  # noqa: BLE001 - reported to the model as a structured error
+                if attempt < attempts and _retryable(exc):
+                    retried = {"type": type(exc).__name__, "message": describe_error(exc)["message"][:300],
+                               "events": manager().events(connection, seconds=30)}
+                    # After a pool clear the driver pauses that pool until the next good heartbeat, so a retry on
+                    # the same client usually fails again: retry on a fresh client (new pools, new probe/fallback).
+                    manager().reset(connection)
+                    continue
+                out = _error(exc)
+                if is_network_error(exc):
+                    err = out["error"]
+                    err["stage"] = getattr(exc, "mcp_stage", "operation")
+                    topo = _topology(connection)
+                    if topo:
+                        err["servers"] = topo
+                    events = manager().events(connection)
+                    if events:
+                        err["events"] = events
+                    if retried:
+                        err["retried"] = True
+                    if kind == "write" and err["stage"] == "operation":
+                        err["write_outcome"] = WRITE_OUTCOME_UNKNOWN
                     manager().reset(connection)  # next call reconnects and re-probes the replica set
-            return out
+                return out
+        raise AssertionError("unreachable")  # pragma: no cover
 
     result = await anyio.to_thread.run_sync(guarded)
     return json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -106,6 +150,20 @@ def _coll(connection: str | None, database: str | None, collection: str):
     if not collection or not str(collection).strip():
         raise ValueError("'collection' is required")
     return _db(connection, database)[collection]
+
+
+def _read_command(db: Any, cmd: dict[str, Any]) -> dict[str, Any]:
+    """Run a read-only command with the profile's read preference (pymongo's list_collections / list_indexes
+    helpers always select the primary, so they could fail while the members the profile reads from are fine)."""
+    return db.command(cmd, read_preference=db.client.read_preference)
+
+
+def _first_batch(db: Any, cmd: dict[str, Any]) -> tuple[list[Any], bool]:
+    """All results of a small cursor command in one batch; (items, more_available)."""
+    cmd = {**cmd, "cursor": {"batchSize": 100000}}
+    res = _read_command(db, cmd)
+    cursor = res.get("cursor") or {}
+    return list(cursor.get("firstBatch", [])), bool(cursor.get("id"))
 
 
 def _writable(connection: str | None) -> None:
@@ -172,7 +230,7 @@ def tool(annotations: ToolAnnotations):
 @tool(_READ)
 async def list_connections() -> str:
     """List configured MongoDB connection profiles (passwords are never shown; broken ones show their error)."""
-    return await _call(lambda: {"default": manager().default, "connections": manager().describe()})
+    return await _call(lambda: {"default": manager().default, "connections": manager().describe()}, kind="meta")
 
 
 def _server_info(connection: str | None) -> dict[str, Any]:
@@ -208,6 +266,10 @@ def _server_info(connection: str | None) -> dict[str, Any]:
         "transactions_supported": topology.startswith(("replica set", "sharded")) or bool(
             fallback and fallback["role"] == "primary" and hello.get("setName")),
     }}
+    types = [sd.server_type_name for sd in cli.topology_description.server_descriptions().values()]
+    info["server"]["members_seen"] = types
+    info["server"]["primary_reachable"] = any(t in ("RSPrimary", "Standalone", "Mongos") for t in types)
+    info["runtime"] = runtime_info()
     if fallback:
         info["server"]["direct_fallback"] = fallback
         if fallback["role"] != "primary":
@@ -217,11 +279,20 @@ def _server_info(connection: str | None) -> dict[str, Any]:
     return info
 
 
+def runtime_info() -> dict[str, Any]:
+    """Which process / version actually answers - an old MCP process can keep running after an update."""
+    from . import __file__ as pkg_file
+
+    return {"mongo_mcp": __version__, "pid": os.getpid(), "started_at": _STARTED_AT,
+            "python": f"{sys.version.split()[0]} ({struct.calcsize('P') * 8}-bit)",
+            "module": os.path.dirname(os.path.abspath(pkg_file))}
+
+
 @tool(_READ)
 async def test_connection(connection: str | None = None) -> str:
     """Connect and return server version, edition, topology (standalone / replica set / sharded), the authenticated
     user and whether transactions are supported."""
-    return await _call(lambda: _server_info(connection), connection)
+    return await _call(lambda: _server_info(connection), connection, kind="read")
 
 
 @tool(_WRITE)
@@ -247,7 +318,7 @@ async def add_connection(name: str, host: str | None = None, uri: str | None = N
         info = _server_info(name)
         info["added"] = name
         return info
-    return await _call(run, name)
+    return await _call(run, name, kind="meta")
 
 
 @tool(_WRITE)
@@ -256,7 +327,7 @@ async def remove_connection(name: str) -> str:
     def run():
         manager().remove(name)
         return {"removed": name, "default": manager().default}
-    return await _call(run)
+    return await _call(run, kind="meta")
 
 
 # ====================================================================== exploration
@@ -265,12 +336,12 @@ async def remove_connection(name: str) -> str:
 async def list_databases(connection: str | None = None) -> str:
     """List databases with size on disk (only the ones the login may see)."""
     def run():
-        res = manager().client(connection).admin.command("listDatabases", authorizedDatabases=True)
+        res = _read_command(manager().client(connection).admin, {"listDatabases": 1, "authorizedDatabases": True})
         dbs = [{"name": d["name"], "size_mb": round(d.get("sizeOnDisk", 0) / 1048576, 2), "empty": d.get("empty")}
                for d in res.get("databases", [])]
         return {"databases": sorted(dbs, key=lambda d: d["name"]),
                 "total_size_mb": round(res.get("totalSize", 0) / 1048576, 2)}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -282,7 +353,9 @@ async def list_collections(connection: str | None = None, database: str | None =
         db = _db(connection, database)
         flt = {"name": {"$regex": name_filter}} if name_filter else {}
         items = []
-        for info in db.list_collections(filter=flt, authorizedCollections=True, nameOnly=False):
+        infos, more = _first_batch(db, {"listCollections": 1, "filter": flt, "nameOnly": False,
+                                        "authorizedCollections": True})
+        for info in infos:
             entry: dict[str, Any] = {"name": info["name"], "type": info.get("type", "collection")}
             opts = info.get("options") or {}
             if opts.get("validator"):
@@ -297,8 +370,11 @@ async def list_collections(connection: str | None = None, database: str | None =
                 except Exception:  # noqa: BLE001 - counts are best effort
                     pass
             items.append(entry)
-        return {"database": db.name, "collections": sorted(items, key=lambda c: c["name"])}
-    return await _call(run, connection)
+        out = {"database": db.name, "collections": sorted(items, key=lambda c: c["name"])}
+        if more:
+            out["truncated"] = True
+        return out
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -306,23 +382,24 @@ async def collection_stats(collection: str, connection: str | None = None, datab
     """Document count, data / storage / index sizes (MB), average document size, index sizes, capped flag."""
     def run():
         db = _db(connection, database)
-        s = db.command("collStats", collection)
+        s = _read_command(db, {"collStats": collection})
         mb = lambda v: round((v or 0) / 1048576, 3)  # noqa: E731
         return {"collection": collection, "count": s.get("count"), "size_mb": mb(s.get("size")),
                 "storage_size_mb": mb(s.get("storageSize")), "avg_obj_size_bytes": s.get("avgObjSize"),
                 "total_index_size_mb": mb(s.get("totalIndexSize")), "index_count": s.get("nindexes"),
                 "index_sizes_mb": {k: mb(v) for k, v in (s.get("indexSizes") or {}).items()},
                 "capped": s.get("capped", False)}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
 async def list_indexes(collection: str, connection: str | None = None, database: str | None = None) -> str:
     """Indexes of a collection with keys and options (unique, sparse, TTL, partial filter)."""
     def run():
-        idx = [to_jsonable(i) for i in _coll(connection, database, collection).list_indexes()]
-        return {"collection": collection, "indexes": idx}
-    return await _call(run, connection)
+        coll = _coll(connection, database, collection)
+        items, _ = _first_batch(coll.database, {"listIndexes": coll.name})
+        return {"collection": collection, "indexes": [to_jsonable(i) for i in items]}
+    return await _call(run, connection, kind="read")
 
 
 _TYPE_NAMES = {
@@ -364,7 +441,7 @@ async def infer_schema(collection: str, connection: str | None = None, database:
         fields = [{"path": p, "types": t, "present_pct": round(100 * sum(t.values()) / len(docs), 1) if docs else 0}
                   for p, t in sorted(stats.items())]
         return {"collection": collection, "sampled": len(docs), "fields": fields}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 # ====================================================================== reads
@@ -384,7 +461,7 @@ async def find(collection: str, filter: Any = None, projection: Any = None, sort
             sort=_sort_spec(sort), skip=max(0, int(skip)), limit=n + 1, max_time_ms=_max_time(connection, max_time_ms),
             collation=_collation(collation))
         return collect_documents(cursor, n)
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -406,7 +483,7 @@ async def aggregate(collection: str, pipeline: Any, connection: str | None = Non
         if mt:
             kwargs["maxTimeMS"] = mt
         return collect_documents(_coll(connection, database, collection).aggregate(stages, **kwargs), n)
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -423,7 +500,7 @@ async def count_documents(collection: str, filter: Any = None, estimated: bool =
         if col:
             kwargs["collation"] = col
         return {"count": coll.count_documents(parse_ejson(filter, "filter") or {}, **kwargs)}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -437,7 +514,7 @@ async def distinct(collection: str, field: str, filter: Any = None, connection: 
         if len(values) > 5000:
             out["truncated"] = True
         return out
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 # ====================================================================== writes
@@ -458,7 +535,7 @@ async def insert_documents(collection: str, documents: Any, connection: str | No
             raise ValueError("'documents' must be a non-empty array of objects")
         res = coll.insert_many(docs, ordered=ordered)
         return {"inserted_count": len(res.inserted_ids), "inserted_ids": to_jsonable(res.inserted_ids[:1000])}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_WRITE)
@@ -485,7 +562,7 @@ async def update_documents(collection: str, filter: Any, update: Any, many: bool
         if res.upserted_id is not None:
             out["upserted_id"] = to_jsonable(res.upserted_id)
         return out
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_WRITE)
@@ -503,7 +580,7 @@ async def replace_document(collection: str, filter: Any, replacement: Any, upser
         if res.upserted_id is not None:
             out["upserted_id"] = to_jsonable(res.upserted_id)
         return out
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_DESTRUCTIVE)
@@ -520,7 +597,7 @@ async def delete_documents(collection: str, filter: Any, many: bool = False, con
         coll = _coll(connection, database, collection)
         res = (coll.delete_many if many else coll.delete_one)(flt, collation=_collation(collation))
         return {"deleted_count": res.deleted_count}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 _TX_OPS = {"insert", "insert_many", "update", "update_many", "replace", "delete", "delete_many"}
@@ -590,7 +667,7 @@ async def run_transaction(operations: Any, connection: str | None = None, databa
             out["committed"] = False
             return out
         return {"committed": True, "results": results}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 # ====================================================================== indexes & collections
@@ -616,7 +693,7 @@ async def create_index(collection: str, keys: Any, name: str | None = None, uniq
             kwargs["partialFilterExpression"] = parse_ejson(partial_filter, "partial_filter")
         created = _coll(connection, database, collection).create_index(items, **kwargs)
         return {"index": created}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_DESTRUCTIVE)
@@ -628,7 +705,7 @@ async def drop_index(collection: str, name: str, connection: str | None = None, 
             raise ValueError("The _id index cannot be dropped")
         _coll(connection, database, collection).drop_index(name)
         return {"dropped": name}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_WRITE)
@@ -645,7 +722,7 @@ async def create_collection(name: str, options: Any = None, connection: str | No
         cmd.update(opts)
         db.command(cmd)
         return {"created": name, "database": db.name}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_DESTRUCTIVE)
@@ -661,7 +738,7 @@ async def drop_collection(collection: str, confirm_name: str, connection: str | 
             raise ValueError(f"Collection '{collection}' does not exist in database '{db.name}'")
         db.drop_collection(collection)
         return {"dropped": collection, "database": db.name}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_WRITE)
@@ -672,7 +749,7 @@ async def rename_collection(collection: str, new_name: str, drop_target: bool = 
         _writable(connection)
         _coll(connection, database, collection).rename(new_name, dropTarget=drop_target)
         return {"renamed": collection, "to": new_name}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_DESTRUCTIVE)
@@ -686,7 +763,7 @@ async def drop_database(database: str, confirm_name: str, connection: str | None
             raise ValueError(f"Refusing to drop system database '{database}'")
         manager().client(connection).drop_database(database)
         return {"dropped": database}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 # ====================================================================== commands & administration
@@ -709,7 +786,7 @@ async def run_command(command: Any, connection: str | None = None, database: str
         if len(text) > MAX_RESPONSE_CHARS:
             return {"truncated": True, "result_text": text[:MAX_RESPONSE_CHARS]}
         return {"result": json.loads(text)}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 @tool(_READ)
@@ -722,7 +799,7 @@ async def server_status(connection: str | None = None) -> str:
                 "connections": to_jsonable(s.get("connections")), "opcounters": to_jsonable(s.get("opcounters")),
                 "memory_mb": to_jsonable(s.get("mem")), "replica_set": repl.get("setName"),
                 "is_primary": repl.get("isWritablePrimary", repl.get("ismaster"))}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_READ)
@@ -746,7 +823,7 @@ async def current_ops(connection: str | None = None, active_only: bool = True, m
                         "app_name": op.get("appName"), "command": command[:2000]})
         ops.sort(key=lambda o: -o["secs_running"])
         return {"count": len(ops), "operations": ops[:500]}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="read")
 
 
 @tool(_DESTRUCTIVE)
@@ -756,7 +833,7 @@ async def kill_op(opid: Any, connection: str | None = None) -> str:
         _writable(connection)
         manager().client(connection).admin.command("killOp", op=opid)
         return {"killed": opid}
-    return await _call(run, connection)
+    return await _call(run, connection, kind="write")
 
 
 def run_stdio() -> None:

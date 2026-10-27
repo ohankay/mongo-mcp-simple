@@ -468,3 +468,60 @@ def test_fallback_disabled_gives_clear_error(bad_rs):
     e = err(call(T.test_connection))
     assert "Could not reach" in e["message"] and e["servers"]
     assert T._manager.existing_client("bad") is None  # reset so the next call reconnects
+
+
+# ====================================================================== RCA follow-ups with a real driver cancellation
+
+def test_test_connection_reports_runtime_and_members(ctx):
+    res = ok(call(T.test_connection))
+    assert res["runtime"]["mongo_mcp"] and res["runtime"]["pid"] == os.getpid()
+    assert res["server"]["primary_reachable"] is True and res["server"]["members_seen"] == ["Standalone"]
+
+
+def test_unreachable_error_has_stage_and_events(ctx):
+    ctx["mgr"].add(MongoProfile(name="dead2", host="127.0.0.1:1", server_selection_timeout_ms=1500))
+    try:
+        e = err(call(T.find, collection="x", connection="dead2", database=TEST_DB))
+        assert e["stage"] == "connect" and e["servers"]
+        assert any(ev["event"] in ("heartbeat_failed", "server_changed") and ev.get("address") == "127.0.0.1:1"
+                   for ev in e["events"]), e["events"]
+    finally:
+        ctx["mgr"].remove("dead2")
+
+
+def _interrupt_pools_soon(mgr, name, delay):
+    def run():
+        time.sleep(delay)
+        cli = mgr.existing_client(name)
+        for srv in cli._topology._servers.values():  # what the driver does after a failed heartbeat
+            srv.pool.reset(interrupt_connections=True)
+    th = threading.Thread(target=run)
+    th.start()
+    return th
+
+
+def test_real_operation_cancel_on_read_is_retried_on_fresh_client(ctx):
+    ok(call(T.insert_documents, collection="cancel", documents=[{"i": i} for i in range(20)]))
+    first = ctx["mgr"].client("main")
+    th = _interrupt_pools_soon(ctx["mgr"], "main", 0.6)
+    res = ok(call(T.find, collection="cancel", filter={"$where": "sleep(100) || true"}, limit=50))
+    th.join()
+    assert res["count"] == 20, res
+    assert res["retried_after"]["type"] in ("_OperationCancelled", "AutoReconnect"), res["retried_after"]
+    assert any(ev["event"] == "pool_cleared" and ev["interrupted_in_use_connections"]
+               for ev in res["retried_after"]["events"])
+    assert ctx["mgr"].client("main") is not first  # recovered on a new client
+
+
+def test_real_operation_cancel_on_write_is_not_retried(ctx):
+    ok(call(T.insert_documents, collection="cancelw", documents=[{"i": i} for i in range(20)]))
+    ctx["mgr"].client("main")
+    th = _interrupt_pools_soon(ctx["mgr"], "main", 0.6)
+    res = call(T.update_documents, collection="cancelw", filter={"$where": "sleep(100) || true"},
+               update={"$inc": {"n": 1}}, many=True)
+    th.join()
+    e = err(res)
+    assert e["stage"] == "operation" and e["write_outcome"].startswith("unknown") and "retried" not in e
+    assert any(ev["event"] == "pool_cleared" for ev in e["events"])
+    # the next call works on a fresh client and shows what actually happened
+    assert ok(call(T.count_documents, collection="cancelw"))["count"] == 20

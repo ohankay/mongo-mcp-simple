@@ -40,7 +40,9 @@ def _check(connection: str | None) -> int:
         except Exception as exc:  # noqa: BLE001
             info = _error(exc)
             if is_network_error(exc):
+                info["error"]["stage"] = getattr(exc, "mcp_stage", "operation")
                 info["error"]["servers"] = _topology(name)
+                info["error"]["events"] = mgr.events(name)
         ok = ok and bool(info.get("success"))
         report["connections"][name] = info
     mgr.close_all()

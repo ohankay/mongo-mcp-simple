@@ -300,13 +300,16 @@ def test_server_monitoring_mode():
     pymongo.MongoClient("h", connect=False, **client_kwargs(MongoProfile(name="a", host="h"))[1]).close()
 
 
-def test_operation_cancelled_is_explained():
+def test_operation_cancelled_is_explained_without_guessing():
     from pymongo import errors as pe
 
     from mongo_mcp.errors import describe_error, is_network_error
     exc = pe._OperationCancelled("operation cancelled")
     info = describe_error(exc)
-    assert info["type"] == "_OperationCancelled" and "connection to the server was reset" in info["message"]
+    assert info["type"] == "_OperationCancelled" and "pool of the server it was using was cleared" in info["message"]
+    assert "events" in info["message"]
+    for guess in ("firewall", "VPN", "unreachable replica set member"):
+        assert guess not in info["message"]  # the cause must come from recorded events, not from a fixed text
     assert is_network_error(exc) and is_network_error(pe.ServerSelectionTimeoutError("x"))
     assert "Lost the connection" in describe_error(pe.AutoReconnect("connection closed"))["message"]
     assert not is_network_error(ValueError("x"))
@@ -432,3 +435,192 @@ def test_fallback_all_hosts_fail_and_auth_errors_are_not_masked():
                             "h3:3": {"ok": 1}})
     with pytest.raises(OperationFailure, match="Authentication failed"):
         mgr.client("m")
+
+
+# ---------------------------------------------------------------- RCA 2026-10-27 follow-ups (1.0.3)
+
+import asyncio as _asyncio  # noqa: E402
+import datetime as _dt  # noqa: E402
+
+from pymongo import errors as _pe  # noqa: E402
+from pymongo import monitoring as _mon  # noqa: E402
+
+from mongo_mcp import server as _server  # noqa: E402
+from mongo_mcp.events import EventRecorder  # noqa: E402
+
+
+def test_event_recorder_keeps_evidence_without_payloads():
+    rec = EventRecorder()
+    rec.failed(_mon.ServerHeartbeatFailedEvent(0.25, _pe.NetworkTimeout("db01:27012: timed out"), ("db01", 27012)))
+    rec.pool_cleared(_mon.PoolClearedEvent(("db01", 27012), None, True))
+    rec.failed(_mon.CommandFailedEvent(_dt.timedelta(milliseconds=12), {"errmsg": "operation cancelled", "ok": 0},
+                                       "listCollections", 1, ("db01", 27012), 1))
+    rec.started(object())
+    rec.succeeded(object())
+    events = rec.recent()
+    assert [e["event"] for e in events] == ["heartbeat_failed", "pool_cleared", "command_failed"]
+    assert events[0]["address"] == "db01:27012" and events[0]["duration_ms"] == 250.0 and "timed out" in events[0]["error"]
+    assert events[1]["interrupted_in_use_connections"] is True
+    assert events[2]["command"] == "listCollections" and events[2]["error"] == "operation cancelled"
+    assert all("at" in e and "_mono" not in e for e in events)
+    assert rec.recent(seconds=-1) == []
+    for _ in range(300):
+        rec.pool_cleared(_mon.PoolClearedEvent(("h", 1)))
+    assert len(rec.recent(limit=1000)) == 200  # bounded ring buffer
+
+
+class _SeqAdmin:
+    """admin.command() returning / raising the next item of a sequence (last one repeats)."""
+
+    def __init__(self, seq):
+        self.seq = list(seq)
+        self.calls = 0
+
+    def command(self, name, **kw):
+        item = self.seq[min(self.calls, len(self.seq) - 1)]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _SeqClient:
+    read_preference = None
+
+    def __init__(self, seq):
+        self.admin = _SeqAdmin(seq)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _seq_manager(set_seq, hosts):
+    opened = []
+
+    def opener(p):
+        direct = p.direct_connection is True
+        cli = _SeqClient(hosts[p.host] if direct else set_seq)
+        opened.append((p.host if direct else "set", cli))
+        return cli
+    prof = MongoProfile(name="m", host="h1:1,h2:2", replica_set="rs")
+    return ClientManager({"m": prof}, "m", opener=opener, probe=True), opened
+
+
+def test_probe_retries_operation_cancelled_once_before_falling_back():
+    cancelled = _pe._OperationCancelled("operation cancelled")
+    mgr, opened = _seq_manager([cancelled, {"ok": 1}], {})
+    mgr.client("m")
+    assert [t for t, _ in opened] == ["set"] and opened[0][1].admin.calls == 2 and mgr.fallback_info("m") is None
+
+
+def test_probe_falls_back_after_repeated_operation_cancelled():
+    cancelled = _pe._OperationCancelled("operation cancelled")
+    mgr, opened = _seq_manager([cancelled], {"h1:1": [{"ok": 1, "isWritablePrimary": True}], "h2:2": [{"ok": 1}]})
+    mgr.client("m")
+    assert [t for t, _ in opened] == ["set", "h1:1"] and opened[0][1].closed
+    assert mgr.fallback_info("m")["role"] == "primary" and "operation cancelled" in mgr.fallback_info("m")["reason"]
+
+
+def test_connect_failures_are_marked_as_connect_stage():
+    sst = _pe.ServerSelectionTimeoutError("no set, Timeout: 1s")
+    mgr, _ = _seq_manager([sst], {"h1:1": [_pe.ServerSelectionTimeoutError("down, Timeout: 1s")],
+                                  "h2:2": [_pe.ServerSelectionTimeoutError("down, Timeout: 1s")]})
+    with pytest.raises(_pe.ServerSelectionTimeoutError) as info:
+        mgr.client("m")
+    assert info.value.mcp_stage == "connect"
+
+
+class _Closable:
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fake_mgr():
+    opened = []
+    mgr = ClientManager({"m": MongoProfile(name="m", host="h")}, "m",
+                        opener=lambda p: opened.append(_Closable()) or opened[-1])
+    previous = _server._manager
+    _server.set_manager(mgr)
+    yield mgr, opened
+    _server.set_manager(previous)
+
+
+def _run(fn, kind):
+    return json.loads(_asyncio.run(_server._call(fn, "m", kind=kind)))
+
+
+def test_read_is_retried_once_on_a_fresh_client(fake_mgr):
+    mgr, opened = fake_mgr
+    calls = []
+
+    def fn():
+        cli = mgr.client("m")
+        calls.append(cli)
+        if len(calls) == 1:
+            raise _pe._OperationCancelled("operation cancelled")
+        return {"value": 1}
+    res = _run(fn, "read")
+    assert res["success"] and res["value"] == 1 and res["retried_after"]["type"] == "_OperationCancelled"
+    assert len(calls) == 2 and calls[0] is not calls[1] and len(opened) == 2  # second attempt used a new client
+
+
+def test_read_failing_twice_resets_and_reports(fake_mgr):
+    mgr, opened = fake_mgr
+
+    def fn():
+        mgr.client("m")
+        raise _pe.AutoReconnect("db01:27012: connection closed")
+    res = _run(fn, "read")
+    err = res["error"]
+    assert res["success"] is False and err["retried"] is True and err["stage"] == "operation"
+    assert "write_outcome" not in err and mgr.existing_client("m") is None and len(opened) == 2
+
+
+def test_write_is_never_retried_and_outcome_is_unknown(fake_mgr):
+    mgr, _ = fake_mgr
+    calls = []
+
+    def fn():
+        mgr.client("m")
+        calls.append(1)
+        raise _pe._OperationCancelled("operation cancelled")
+    err = _run(fn, "write")["error"]
+    assert len(calls) == 1 and err["write_outcome"].startswith("unknown") and "retried" not in err
+    assert mgr.existing_client("m") is None  # next call reconnects
+
+
+def test_server_selection_timeout_and_other_errors_are_not_retried(fake_mgr):
+    mgr, _ = fake_mgr
+    for exc in (_pe.ServerSelectionTimeoutError("no servers"), ValueError("bad input"),
+                _pe.OperationFailure("Unauthorized", 13)):
+        calls = []
+
+        def fn(exc=exc):
+            calls.append(1)
+            raise exc
+        res = _run(fn, "read")
+        assert res["success"] is False and len(calls) == 1, exc
+
+
+def test_explore_commands_use_profile_read_preference():
+    seen = {}
+
+    class _Db:
+        class client:
+            read_preference = "secondaryPreferred-sentinel"
+
+        def command(self, cmd, **kw):
+            seen.update(cmd=cmd, **kw)
+            return {"cursor": {"firstBatch": [{"name": "a"}], "id": 0}}
+    items, more = _server._first_batch(_Db(), {"listCollections": 1})
+    assert items == [{"name": "a"}] and more is False
+    assert seen["read_preference"] == "secondaryPreferred-sentinel" and seen["cmd"]["cursor"]["batchSize"] == 100000
+
+
+def test_runtime_info():
+    info = _server.runtime_info()
+    import os as _os
+    assert info["pid"] == _os.getpid() and info["mongo_mcp"] and info["python"].endswith("-bit)")
+    assert info["module"].endswith("mongo_mcp")
