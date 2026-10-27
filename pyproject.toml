@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mongo-mcp-simple"
-version = "1.0.1"
+version = "1.0.2"
 description = "MCP server for MongoDB (4.4+) for VS Code agents - queries, aggregation, writes, transactions, indexes, admin commands. Password, LDAP, Kerberos (Windows logon), x509 or URI authentication."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -136,6 +136,7 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
 | `MONGO_MCP_MAX_DOCS` | `max_docs` | `100` | Bir sonuçta dönen en fazla doküman (agent bağlamı şişmesin diye) |
 | `MONGO_MCP_MAX_TIME_MS` | `max_time_ms` | `60000` | Sorgu zaman aşımı |
 | `MONGO_MCP_SERVER_SELECTION_TIMEOUT_MS` | `server_selection_timeout_ms` | `10000` | Sunucuya ulaşma zaman aşımı |
+| `MONGO_MCP_FALLBACK_DIRECT` | `fallback_direct` | `true` | Replica set bütün olarak kullanılamazsa (ör. üyeler kendini iç ağ adı / farklı port ile bildiriyorsa), adresteki sunucuları sırayla doğrudan dener ve ilk cevap verenle devam eder |
 | `MONGO_MCP_SERVER_MONITORING_MODE` | `server_monitoring_mode` | `poll` | Sürücünün sunucu izleme yöntemi. `poll`, uzun süre açık kalan bağlantıları kesen firewall/VPN ortamlarında güvenli seçenektir; `stream` sürücünün kendi varsayılanıdır |
 | `MONGO_MCP_CONFIG` | | | Çoklu profil JSON dosyası |
 
@@ -146,6 +147,7 @@ Copilot'a "**prod** bağlantısında son 10 siparişi getir" demeniz yeterli; ag
 * **Türkçe arama:** regex `$options: "i"`, `İ`/`i` ve `I`/`ı` harflerini eşlemez. Büyük/küçük harf duyarsız Türkçe arama için `collation: {"locale": "tr", "strength": 2}` kullanın (`find`, `aggregate`, `count_documents`, `distinct`, `update_documents`, `delete_documents`). Türkçede `ş`, `ğ`, `ç`, `ö`, `ü` ayrı harflerdir; `AYSE`, `Ayşe` ile eşleşmez.
 * **Özel tipler:** Sonuçlar relaxed Extended JSON döner (`{"$oid": "..."}`, `{"$date": "..."}`, `{"$numberDecimal": "..."}`). Bu değerler sonraki sorgularda filtre olarak aynen kullanılabilir.
 * MongoDB'nin kendi `$toUpper` / `$toLower` operatörleri sadece ASCII harfleri dönüştürür ("Ayşe" → "AYşE").
+* **Replica set'e erişim:** Sürücü önce normal replica set bağlantısını dener; profilin okuma tercihine (`readPreference`) uygun en az bir üyeye ulaşabildiği sürece erişilemeyen üyeleri atlar. Replica set üyeleri kendini bilgisayarınızdan erişilemeyen adreslerle bildiriyorsa (iç ağ adları, `localhost`, farklı port; Windows'ta `WinError 10061`), bağlantı adresindeki sunucular **sırayla doğrudan** denenir ve ilk cevap verenle devam edilir. Hangi sunucuya düşüldüğü `test_connection` ve `list_connections` çıktısında `direct_fallback` olarak görünür. Düşülen sunucu secondary ise okumalar çalışır, yazmalar sunucu tarafından reddedilir.
 * Ağ kaynaklı hatalarda (`_OperationCancelled`, `Could not reach`, `Lost the connection`) hata yanıtında `servers` listesi döner: her sunucunun sürücü tarafından görülen durumu, gecikmesi ve son hatası. Sorunun hangi üyede olduğu buradan görülür.
 * `run_transaction` replica set veya sharded cluster gerektirir; standalone sunucuda açık bir hata döner ve hiçbir şey yazılmaz.
 * Sunucu tarafı notu: MongoDB **8.0.x**, Linux çekirdeği 6.19 ve üzerinde başlamayı reddeder ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). 8.2, 7.0 ve öncesi etkilenmez. Bu MCP'yi değil, MongoDB sunucusunun kurulu olduğu makineyi ilgilendirir.

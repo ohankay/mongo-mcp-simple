@@ -62,7 +62,7 @@ def _topology(connection: str | None) -> list[dict[str, Any]] | None:
     try:
         cli = manager().existing_client(connection)
         if cli is None:
-            return None
+            return manager().last_failure(connection)
         servers = []
         for sd in cli.topology_description.server_descriptions().values():
             entry: dict[str, Any] = {"address": f"{sd.address[0]}:{sd.address[1]}", "type": sd.server_type_name}
@@ -89,6 +89,8 @@ async def _call(fn: Callable[[], Any], connection: str | None = None) -> str:
                 topo = _topology(connection)
                 if topo:
                     out["error"]["servers"] = topo
+                if type(exc).__name__ == "ServerSelectionTimeoutError":
+                    manager().reset(connection)  # next call reconnects and re-probes the replica set
             return out
 
     result = await anyio.to_thread.run_sync(guarded)
@@ -189,7 +191,10 @@ def _server_info(connection: str | None) -> dict[str, Any]:
     users = status.get("authInfo", {}).get("authenticatedUsers", [])
     topology = "sharded (mongos)" if hello.get("msg") == "isdbgrid" else (
         f"replica set '{hello['setName']}'" if hello.get("setName") else "standalone")
-    return {"server": {
+    fallback = mgr.fallback_info(connection)
+    if fallback:
+        topology = f"direct connection to {fallback['address']} ({fallback['role']}) - {topology} not reachable as a set"
+    info = {"server": {
         "connection": prof.name,
         "version": build.get("version"),
         "edition": "enterprise" if "enterprise" in build.get("modules", []) else "community",
@@ -200,8 +205,16 @@ def _server_info(connection: str | None) -> dict[str, Any]:
         "default_database": prof.database,
         "readonly_profile": prof.readonly,
         "driver": f"pymongo {pymongo.version}",
-        "transactions_supported": topology != "standalone",
+        "transactions_supported": topology.startswith(("replica set", "sharded")) or bool(
+            fallback and fallback["role"] == "primary" and hello.get("setName")),
     }}
+    if fallback:
+        info["server"]["direct_fallback"] = fallback
+        if fallback["role"] != "primary":
+            info["server"]["warning"] = (
+                f"The replica set could not be used as a whole ({fallback['reason']}); connected directly to "
+                f"{fallback['address']}, which is a {fallback['role']}: reads work, writes will be refused.")
+    return info
 
 
 @tool(_READ)

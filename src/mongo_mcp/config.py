@@ -84,6 +84,7 @@ class MongoProfile:
     max_time_ms: int = 60000
     server_selection_timeout_ms: int = 10000
     server_monitoring_mode: str = "poll"   # poll | stream | auto
+    fallback_direct: bool = True           # replica set unreachable -> try the seed hosts one by one, directly
     app_name: str = "mongo-mcp"
 
     def __post_init__(self) -> None:
@@ -119,7 +120,7 @@ class MongoProfile:
                 raise ConfigError(f"[{self.name}] 'port' must be <= 65535")
         if self.direct_connection is not None:
             self.direct_connection = _to_bool(self.direct_connection, "direct_connection")
-        for flag in ("tls", "tls_allow_invalid_certificates", "readonly"):
+        for flag in ("tls", "tls_allow_invalid_certificates", "readonly", "fallback_direct"):
             setattr(self, flag, _to_bool(getattr(self, flag), flag))
         if self.tls_ca_file or self.tls_certificate_key_file:
             self.tls = True
@@ -191,7 +192,7 @@ _ENV_MAP = {
     "TLS_CERTIFICATE_KEY_FILE": "tls_certificate_key_file", "READ_PREFERENCE": "read_preference",
     "READONLY": "readonly", "MAX_DOCS": "max_docs", "MAX_TIME_MS": "max_time_ms",
     "SERVER_SELECTION_TIMEOUT_MS": "server_selection_timeout_ms", "APP_NAME": "app_name",
-    "SERVER_MONITORING_MODE": "server_monitoring_mode",
+    "SERVER_MONITORING_MODE": "server_monitoring_mode", "FALLBACK_DIRECT": "fallback_direct",
 }
 
 

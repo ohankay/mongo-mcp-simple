@@ -127,6 +127,7 @@ Kurulum burada biter.
 | `environment variable 'MONGO_PW_...' is not set` | `connections.json` içindeki `password_env` adı `mcp.json` `env` bölümünde yok veya farklı yazılmış. İki dosyadaki adı aynı yapın, sunucuyu **Restart** edin. |
 | `USERDNSDOMAIN` hatası (`windows` tipi) | Bilgisayar domain'de değil. `user` alanına Kerberos principal'ınızı yazın: `kullanici@SIRKET.LOCAL`. |
 | `_OperationCancelled` / `Lost the connection` | Sürücünün sunucuyla bağlantısı kesildi (firewall/VPN uzun süreli bağlantıyı kesiyor ya da replica set üyelerinden biri erişilemez). Hata yanıtındaki `servers` listesinde her üyenin durumuna ve son hatasına bakın; erişilemeyen üye için ağ ekibinden erişim isteyin. Sürüm 1.0.1 ile varsayılan izleme yöntemi `poll`'dur; eski kurulumu güncelleyin. |
+| `WinError 10061` / `Replica set is configured with internal hostnames` | Replica set üyeleri kendini bilgisayarınızdan erişilemeyen adreslerle bildiriyor. 1.0.2 ile bağlantı adresindeki sunucular sırayla doğrudan denenir (`direct_fallback`); eski kurulumu güncelleyin. Tüm sunucular reddediyorsa port ve sunucu adlarını DBA ile teyit edin. |
 | `not authorized` (kod 13) | Kullanıcının bu işlem/veritabanı için yetkisi yok. |
 | `Transaction numbers are only allowed on a replica set` | `run_transaction` tek sunuculu (standalone) MongoDB'de çalışmaz; replica set gerekir. |
 | Sunucu başlıyor ama tool'lar görünmüyor | Chat modu **Agent** olmalı. Copilot Business/Enterprise'da "MCP servers in Copilot" politikası açık olmalı. |

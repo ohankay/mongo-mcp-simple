@@ -319,3 +319,116 @@ def test_existing_client_never_opens():
     cli = mgr.client("a")
     assert mgr.existing_client(None) is cli and len(opened) == 1
     assert mgr.describe()[0]["client_open"] is True
+
+
+# ---------------------------------------------------------------- replica set -> direct fallback (1.0.2)
+
+from mongo_mcp.client import _wants_fallback, direct_profile, seed_hosts  # noqa: E402
+
+
+def test_seed_hosts():
+    assert seed_hosts(MongoProfile(name="a", uri="mongodb://u:p@h1:1,h2:2,h3:3/?replicaSet=rs")) == ["h1:1", "h2:2", "h3:3"]
+    assert seed_hosts(MongoProfile(name="a", uri="mongodb://h1/db")) == ["h1"]
+    assert seed_hosts(MongoProfile(name="a", uri="mongodb://h1?replicaSet=rs")) == ["h1"]
+    assert seed_hosts(MongoProfile(name="a", uri="mongodb+srv://c.example.net/")) == []
+    assert seed_hosts(MongoProfile(name="a", host="h1:1, h2:2")) == ["h1:1", "h2:2"]
+    assert seed_hosts(MongoProfile(name="a", host="h1", port=27012)) == ["h1:27012"]
+
+
+def test_direct_profile_rewrites_uri():
+    p = MongoProfile(name="a", uri="mongodb://app:s3cr%40t@h1:27012,h2:27012/mydb?readPreference=secondaryPreferred"
+                                   "&replicaSet=rs0&authSource=admin")
+    d = direct_profile(p, "h2:27012")
+    assert d.uri.startswith("mongodb://app:s3cr%40t@h2:27012/mydb?")
+    assert "replicaSet" not in d.uri and "directConnection=true" in d.uri
+    assert "readPreference=secondaryPreferred" in d.uri and "authSource=admin" in d.uri
+    assert d.server_selection_timeout_ms == 5000 and p.uri.count("h1") == 1  # original untouched
+    d = direct_profile(MongoProfile(name="a", uri="mongodb://h1:1,h2:2?replicaSet=rs"), "h1:1")
+    assert d.uri == "mongodb://h1:1/?directConnection=true"
+    d = direct_profile(MongoProfile(name="a", host="h1,h2", replica_set="rs", user="u", password="p"), "h2")
+    assert d.host == "h2" and d.replica_set is None and d.direct_connection is True and d.password == "p"
+    import pymongo
+    host, kw = client_kwargs(direct_profile(p, "h1:27012"))
+    pymongo.MongoClient(host, connect=False, **kw).close()
+
+
+def test_wants_fallback():
+    assert _wants_fallback(MongoProfile(name="a", host="h1,h2", replica_set="rs"))
+    assert _wants_fallback(MongoProfile(name="a", host="h1"))
+    assert not _wants_fallback(MongoProfile(name="a", host="h1", fallback_direct=False))
+    assert not _wants_fallback(MongoProfile(name="a", host="h1", direct_connection=True))
+    assert not _wants_fallback(MongoProfile(name="a", uri="mongodb://h1/?directConnection=true"))
+    assert not _wants_fallback(MongoProfile(name="a", uri="mongodb+srv://c.example.net/"))
+    assert profile_from_env({"MONGO_MCP_HOST": "h", "MONGO_MCP_FALLBACK_DIRECT": "false"}).fallback_direct is False
+
+
+class _FakeAdmin:
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+
+    def command(self, name, **kw):
+        if isinstance(self.behaviour, Exception):
+            raise self.behaviour
+        return self.behaviour
+
+
+class _FakeClient:
+    read_preference = None
+
+    def __init__(self, behaviour):
+        self.admin = _FakeAdmin(behaviour)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _manager_with(behaviours):
+    """behaviours: target ('set' or a host) -> ping/hello result or exception."""
+    from mongo_mcp.client import ClientManager as CM
+    opened = []
+
+    def opener(p):
+        target = "set" if p.direct_connection is not True and "directConnection" not in (p.uri or "") else (
+            p.host if p.host else p.uri.split("://")[1].split("/")[0])
+        cli = _FakeClient(behaviours[target])
+        opened.append((target, cli))
+        return cli
+    prof = MongoProfile(name="m", host="h1:1,h2:2,h3:3", replica_set="rs")
+    return CM({"m": prof}, "m", opener=opener, probe=True), opened
+
+
+def test_fallback_tries_hosts_in_order():
+    from pymongo.errors import ServerSelectionTimeoutError
+    sst = ServerSelectionTimeoutError("Could not reach any servers in [('internal', 27012)], Timeout: 5s")
+    mgr, opened = _manager_with({"set": sst, "h1:1": ServerSelectionTimeoutError("h1 refused, Timeout: 5s"),
+                                 "h2:2": {"ok": 1, "secondary": True}, "h3:3": {"ok": 1, "isWritablePrimary": True}})
+    cli = mgr.client("m")
+    assert [t for t, _ in opened] == ["set", "h1:1", "h2:2"]  # h3 never tried
+    assert cli is opened[2][1] and opened[0][1].closed and opened[1][1].closed
+    info = mgr.fallback_info("m")
+    assert info["address"] == "h2:2" and info["role"] == "secondary" and "internal" in info["reason"]
+    assert mgr.describe()[0]["direct_fallback"]["address"] == "h2:2"
+    mgr.reset("m")
+    assert mgr.fallback_info("m") is None and mgr.existing_client("m") is None and cli.closed
+
+
+def test_fallback_not_used_when_set_is_reachable():
+    mgr, opened = _manager_with({"set": {"ok": 1}})
+    mgr.client("m")
+    assert [t for t, _ in opened] == ["set"] and mgr.fallback_info("m") is None
+
+
+def test_fallback_all_hosts_fail_and_auth_errors_are_not_masked():
+    from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
+    sst = ServerSelectionTimeoutError("no set, Timeout: 5s")
+    mgr, _ = _manager_with({"set": sst, "h1:1": ServerSelectionTimeoutError("h1 down, Timeout: 1s"),
+                            "h2:2": ServerSelectionTimeoutError("h2 down, Timeout: 1s"),
+                            "h3:3": ServerSelectionTimeoutError("h3 down, Timeout: 1s")})
+    with pytest.raises(ServerSelectionTimeoutError, match="h1 down.*h2 down.*h3 down"):
+        mgr.client("m")
+    assert mgr.existing_client("m") is None
+    mgr, _ = _manager_with({"set": sst, "h1:1": OperationFailure("Authentication failed", 18), "h2:2": {"ok": 1},
+                            "h3:3": {"ok": 1}})
+    with pytest.raises(OperationFailure, match="Authentication failed"):
+        mgr.client("m")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 
@@ -415,3 +416,55 @@ def test_transaction_commit_and_rollback(rs):
     assert "must be one of" in err(call(T.run_transaction, operations=[{"op": "drop", "collection": "x"}]))["message"]
     info = ok(call(T.test_connection))["server"]
     assert info["transactions_supported"] is True and info["topology"].startswith("replica set '")
+
+
+# ====================================================================== replica set with unreachable advertised hosts
+
+BAD_RS = os.environ.get("MONGO_MCP_TEST_BAD_RS")  # rs whose config advertises a host the client cannot reach
+
+
+@pytest.fixture
+def bad_rs():
+    if not BAD_RS:
+        pytest.skip("MONGO_MCP_TEST_BAD_RS not set")
+    previous = T._manager
+    yield
+    if T._manager is not None and T._manager is not previous:
+        T._manager.close_all()
+    T.set_manager(previous)
+
+
+def _bad_manager(**overrides):
+    prof = MongoProfile(name="bad", uri=BAD_RS, database=TEST_DB, server_selection_timeout_ms=3000, **overrides)
+    mgr = ClientManager({"bad": prof}, "bad")
+    T.set_manager(mgr)
+    return mgr
+
+
+def test_direct_fallback_when_replica_set_advertises_unreachable_hosts(bad_rs):
+    _bad_manager()
+    info = ok(call(T.test_connection))["server"]
+    host = BAD_RS.split("://")[1].split("/")[0].split("?")[0].split(",")[-1]
+    assert info["direct_fallback"]["address"] == host and info["direct_fallback"]["role"] == "primary"
+    assert info["topology"].startswith(f"direct connection to {host}") and "warning" not in info
+    ok(call(T.insert_documents, collection="fb", documents={"a": 1}))
+    assert ok(call(T.count_documents, collection="fb"))["count"] == 1
+    conns = ok(call(T.list_connections))["connections"]
+    assert conns[0]["direct_fallback"]["address"] == host
+    ok(call(T.drop_collection, collection="fb", confirm_name="fb"))
+
+
+def test_first_seed_down_second_used(bad_rs):
+    scheme, rest = BAD_RS.split("://", 1)
+    _bad_manager()
+    T._manager.add(MongoProfile(name="two", uri=f"{scheme}://127.0.0.1:1,{rest}", database=TEST_DB,
+                                server_selection_timeout_ms=3000), make_default=True)
+    info = ok(call(T.test_connection, connection="two"))["server"]
+    assert info["direct_fallback"]["address"] != "127.0.0.1:1"
+
+
+def test_fallback_disabled_gives_clear_error(bad_rs):
+    _bad_manager(fallback_direct=False)
+    e = err(call(T.test_connection))
+    assert "Could not reach" in e["message"] and e["servers"]
+    assert T._manager.existing_client("bad") is None  # reset so the next call reconnects
